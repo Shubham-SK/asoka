@@ -1,4 +1,6 @@
 from functools import lru_cache
+import json
+import shlex
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,6 +33,12 @@ class Settings(BaseSettings):
     salesforce_oauth_redirect_uri: str = ""
     oauth_state_secret: str = ""
     token_encryption_key: str = ""
+    read_backend: str = "salesforce_api"
+    salesforce_mcp_command: str = ""
+    salesforce_mcp_args: str = ""
+    salesforce_mcp_env_json: str = "{}"
+    salesforce_mcp_init_timeout_seconds: int = 20
+    salesforce_mcp_tool_timeout_seconds: int = 90
 
     @property
     def slack_enabled(self) -> bool:
@@ -53,6 +61,25 @@ class Settings(BaseSettings):
     @property
     def llm_enabled(self) -> bool:
         return bool(self.anthropic_api_key)
+
+    @property
+    def salesforce_mcp_enabled(self) -> bool:
+        return bool(self.salesforce_mcp_command.strip())
+
+    @property
+    def salesforce_mcp_args_list(self) -> list[str]:
+        value = self.salesforce_mcp_args.strip()
+        if not value:
+            return []
+        return shlex.split(value)
+
+    @property
+    def salesforce_mcp_env(self) -> dict[str, str]:
+        raw = self.salesforce_mcp_env_json.strip() or "{}"
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return {}
+        return {str(k): str(v) for k, v in parsed.items()}
 
 
 @lru_cache

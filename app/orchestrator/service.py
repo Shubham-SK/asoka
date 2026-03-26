@@ -4,6 +4,7 @@ import logging
 from typing import Callable
 
 from app.agent.service import run_read_agent
+from app.agent.mcp_service import run_mcp_read_agent
 from app.config import Settings
 from app.orchestrator.classifier import classify_message
 from app.orchestrator.plan_agent import run_plan_agent
@@ -87,6 +88,34 @@ class Orchestrator:
         conversation_window: str = "",
         progress_callback: Callable[[str], None] | None = None,
     ) -> str:
+        backend = self.settings.read_backend.strip().lower()
+        if backend == "salesforce_mcp":
+            if not self.settings.salesforce_mcp_enabled:
+                return (
+                    "Read backend is set to Salesforce MCP, but MCP is not configured. "
+                    "Set SALESFORCE_MCP_COMMAND and SALESFORCE_MCP_ARGS."
+                )
+            if not self.settings.llm_enabled or self.settings.llm_provider != "anthropic":
+                return (
+                    "Read request received, but Claude is not configured. "
+                    "Set LLM_PROVIDER=anthropic, LLM_MODEL, and ANTHROPIC_API_KEY."
+                )
+            try:
+                return run_mcp_read_agent(
+                    settings=self.settings,
+                    user_text=text,
+                    parsed_intent=parsed_intent,
+                    parsed_intent_reason=parsed_intent_reason,
+                    conversation_window=conversation_window,
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc:
+                logger.exception("MCP read agent failed: %s", exc)
+                return (
+                    "I could not complete this MCP read request. Verify MCP server configuration "
+                    "and local Salesforce CLI authorization."
+                )
+
         if not self.settings.salesforce_enabled and not has_user_oauth_identity(
             slack_user_id=user_id,
             workspace_id=workspace_id or "default",

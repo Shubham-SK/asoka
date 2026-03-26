@@ -37,6 +37,7 @@ Fill required values:
 - `SALESFORCE_DOMAIN` should be `login` or `test` (not a full URL)
 - For per-user OAuth (recommended): `SALESFORCE_OAUTH_CLIENT_ID`, `SALESFORCE_OAUTH_CLIENT_SECRET`, `SALESFORCE_OAUTH_REDIRECT_URI`
 - OAuth state/token secrets: `OAUTH_STATE_SECRET`, `TOKEN_ENCRYPTION_KEY`
+- Optional MCP backend: `READ_BACKEND=salesforce_mcp`, `SALESFORCE_MCP_COMMAND`, `SALESFORCE_MCP_ARGS`
 - Public base URL for links: `APP_BASE_URL` (for local dev use your tunnel URL)
 - Database: `DATABASE_URL` (defaults to local SQLite if omitted)
 
@@ -68,6 +69,9 @@ In your Slack app config:
   - Claude-driven agent loop can choose read-only tools:
     - Salesforce object describe
     - Read-only SOQL query (`SELECT ...` only)
+  - Optional Salesforce DX MCP backend:
+    - Set `READ_BACKEND=salesforce_mcp`
+    - The MCP agent auto-filters mutating tools by name and blocks disallowed calls at runtime
   - Auth path priority:
     - Per-user Salesforce OAuth token (if connected)
     - Fallback integration credentials from env
@@ -129,3 +133,34 @@ Restart app after updating env.
    - `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
 9. Restart the app.
 10. In Slack DM with the bot, send `connect salesforce` and complete the OAuth flow.
+
+## Salesforce DX MCP Setup (Read-Only Path)
+
+Use this when you want read coverage from Salesforce DX MCP tools instead of handwritten read tools.
+
+1. Install prerequisites:
+   - Node.js 18+
+   - Salesforce CLI
+   - Python dependency `mcp` (included in this project dependency list)
+2. Authorize at least one org locally with Salesforce CLI:
+   - `sf org login web -a <your_alias>`
+3. Verify your default org, or decide explicit `--orgs` value:
+   - `sf org list`
+4. Configure env vars:
+   - `READ_BACKEND=salesforce_mcp`
+   - `SALESFORCE_MCP_COMMAND=npx`
+   - `SALESFORCE_MCP_ARGS=-y @salesforce/mcp@latest --orgs DEFAULT_TARGET_ORG --toolsets orgs,data --tools list_all_orgs,get_username,run_soql_query`
+5. Optional hardening:
+   - Keep `--tools` limited to read-oriented tools.
+   - Avoid `--toolsets all` unless you explicitly need it.
+   - Avoid `--allow-non-ga-tools` unless required.
+6. Restart the app.
+7. Test in DM with a simple read prompt, for example:
+   - "List 5 accounts from Salesforce."
+
+### Recommended MCP Permission Scope
+
+- `--orgs`: Prefer `DEFAULT_TARGET_ORG` or specific alias; avoid `ALLOW_ALL_ORGS` unless necessary.
+- `--toolsets`: Prefer `orgs,data` for read scenarios.
+- `--tools`: Start with `list_all_orgs,get_username,run_soql_query`.
+- Keep your bot in `READ_BACKEND=salesforce_mcp` only after local CLI auth is working.
