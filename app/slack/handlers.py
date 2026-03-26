@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import logging
 
 from app.config import Settings
+from app.db.enums import PlanStatus
 from app.db.repository import (
     append_conversation_message,
+    get_execution_plan_for_workspace,
     load_conversation_window,
+    set_execution_plan_status,
     set_user_context_entry,
 )
 from app.db.session import SessionLocal
@@ -86,7 +90,7 @@ def register_handlers(slack_app, settings: Settings) -> None:
             try:
                 posted = client.chat_postMessage(
                     channel=channel_id,
-                    text="Working on it... I will post step-by-step updates here.",
+                    text="Thinking...",
                 )
                 response_ts = str(posted.get("ts", "") or "")
             except Exception as exc:
@@ -100,12 +104,47 @@ def register_handlers(slack_app, settings: Settings) -> None:
             except Exception as exc:
                 logger.info("Could not update streaming progress message: %s", exc)
 
+        def plan_notification_callback(
+            plan_id: str,
+            callback_workspace_id: str,
+            requester_slack_user_id: str,
+            summary: str,
+        ) -> None:
+            _notify_coworker_pending_plan(
+                client=client,
+                settings=settings,
+                workspace_id=callback_workspace_id,
+                requester_slack_user_id=requester_slack_user_id,
+                plan_id=plan_id,
+                summary=summary,
+            )
+
+        def plan_status_notification_callback(
+            plan_id: str,
+            callback_workspace_id: str,
+            requester_slack_user_id: str,
+            status: str,
+            reason: str,
+            actor_slack_user_id: str,
+        ) -> None:
+            _notify_requester_plan_status(
+                client=client,
+                plan_id=plan_id,
+                workspace_id=callback_workspace_id,
+                requester_slack_user_id=requester_slack_user_id,
+                status=status,
+                reason=reason,
+                actor_slack_user_id=actor_slack_user_id,
+            )
+
         response = orchestrator.handle_message(
             user_id=user_id,
             text=text,
             workspace_id=workspace_id,
             conversation_window=conversation_window,
             progress_callback=progress_update,
+            plan_notification_callback=plan_notification_callback,
+            plan_status_notification_callback=plan_status_notification_callback,
         )
         if channel_id and response_ts:
             try:
@@ -134,6 +173,76 @@ def register_handlers(slack_app, settings: Settings) -> None:
     @slack_app.event("app_mention")
     def ignore_mentions(body, logger):  # noqa: ANN001
         logger.info("Ignoring app_mention event in DM-only mode")
+
+    @slack_app.action("approve_plan_button")
+    def handle_approve_plan_button(ack, body, client, logger):  # noqa: ANN001
+        ack()
+        actor_user_id = str(body.get("user", {}).get("id", "") or "")
+        if actor_user_id != settings.slack_coworker_user_id:
+            if actor_user_id:
+                client.chat_postMessage(
+                    channel=actor_user_id,
+                    text="Only the designated human coworker can approve plans.",
+                )
+            return
+
+        action_list = body.get("actions", [])
+        if not action_list:
+            return
+        raw_value = str(action_list[0].get("value", "") or "")
+        try:
+            payload = json.loads(raw_value)
+        except json.JSONDecodeError:
+            client.chat_postMessage(channel=actor_user_id, text="Could not parse approve action payload.")
+            return
+
+        workspace_id = str(payload.get("workspace_id", "") or "default")
+        plan_id = str(payload.get("plan_id", "") or "")
+        requester_slack_user_id = str(payload.get("requester_slack_user_id", "") or "")
+        if not plan_id:
+            client.chat_postMessage(channel=actor_user_id, text="Approve action missing plan_id.")
+            return
+
+        with SessionLocal() as db:
+            try:
+                plan = set_execution_plan_status(
+                    db=db,
+                    workspace_id=workspace_id,
+                    plan_id=plan_id,
+                    status=PlanStatus.approved,
+                    reason="approved via Slack button",
+                    actor_slack_user_id=actor_user_id,
+                    allowed_from_statuses=[PlanStatus.pending_approval],
+                )
+            except ValueError as exc:
+                client.chat_postMessage(
+                    channel=actor_user_id,
+                    text=f"Cannot approve plan `{plan_id}`: {exc}",
+                )
+                return
+            if plan is None:
+                client.chat_postMessage(
+                    channel=actor_user_id,
+                    text=f"No plan found for ID `{plan_id}` in workspace `{workspace_id}`.",
+                )
+                return
+            requester_slack_user_id = requester_slack_user_id or plan.requester_slack_user_id
+            db.commit()
+
+        client.chat_postMessage(
+            channel=actor_user_id,
+            text=f"Plan `{plan_id}` approved.",
+        )
+        if requester_slack_user_id:
+            _notify_requester_plan_status(
+                client=client,
+                plan_id=plan_id,
+                workspace_id=workspace_id,
+                requester_slack_user_id=requester_slack_user_id,
+                status=PlanStatus.approved.value,
+                reason="approved via Slack button",
+                actor_slack_user_id=actor_user_id,
+            )
 
 
 def _load_dm_conversation_window_from_db(
@@ -209,3 +318,107 @@ def _append_message_to_db(
             db.commit()
     except Exception as exc:
         logger.info("Could not append conversation message to DB: %s", exc)
+
+
+def _notify_coworker_pending_plan(
+    client,
+    settings: Settings,
+    workspace_id: str,
+    requester_slack_user_id: str,
+    plan_id: str,
+    summary: str,
+) -> None:
+    if not settings.plan_notify_coworker_on_create:
+        return
+    if requester_slack_user_id == settings.slack_coworker_user_id:
+        return
+    if not settings.slack_coworker_user_id:
+        return
+
+    msg = (
+        "New write plan pending approval.\n"
+        f"- Workspace: `{workspace_id}`\n"
+        f"- Requester: <@{requester_slack_user_id}>\n"
+        f"- Plan ID: `{plan_id}`\n"
+        "You can approve via button, or reply with `approve/reject plan <plan_id> ...`."
+    )
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*New write plan pending approval*\n"
+                    f"Workspace: `{workspace_id}`\n"
+                    f"Requester: <@{requester_slack_user_id}>\n"
+                    f"Plan ID: `{plan_id}`\n"
+                    f"Summary: {summary}"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve Plan"},
+                    "style": "primary",
+                    "action_id": "approve_plan_button",
+                    "value": json.dumps(
+                        {
+                            "workspace_id": workspace_id,
+                            "plan_id": plan_id,
+                            "requester_slack_user_id": requester_slack_user_id,
+                        },
+                        ensure_ascii=True,
+                    ),
+                }
+            ],
+        },
+    ]
+    try:
+        client.chat_postMessage(
+            channel=settings.slack_coworker_user_id,
+            text=msg,
+            blocks=blocks,
+        )
+    except Exception as exc:
+        logger.info("Could not notify coworker about pending plan: %s", exc)
+
+
+def _notify_requester_plan_status(
+    client,
+    plan_id: str,
+    workspace_id: str,
+    requester_slack_user_id: str,
+    status: str,
+    reason: str,
+    actor_slack_user_id: str,
+) -> None:
+    if not requester_slack_user_id:
+        return
+    status_label = str(status).strip().lower()
+    if status_label == PlanStatus.approved.value:
+        text = (
+            f"Your write plan `{plan_id}` was *approved* by <@{actor_slack_user_id}>.\n"
+            f"Workspace: `{workspace_id}`\n"
+            "Execution can proceed once executor wiring is enabled."
+        )
+    elif status_label == PlanStatus.denied.value:
+        reason_text = reason.strip() or "No reason provided."
+        text = (
+            f"Your write plan `{plan_id}` was *denied* by <@{actor_slack_user_id}>.\n"
+            f"Workspace: `{workspace_id}`\n"
+            f"Feedback: {reason_text}"
+        )
+    else:
+        reason_text = reason.strip() or "No additional feedback."
+        text = (
+            f"Your write plan `{plan_id}` status changed to `{status_label}` by <@{actor_slack_user_id}>.\n"
+            f"Workspace: `{workspace_id}`\n"
+            f"Feedback: {reason_text}"
+        )
+    try:
+        client.chat_postMessage(channel=requester_slack_user_id, text=text)
+    except Exception as exc:
+        logger.info("Could not notify requester about plan status update: %s", exc)

@@ -6,6 +6,7 @@ from typing import Callable
 from app.agent.service import run_read_agent
 from app.config import Settings
 from app.orchestrator.classifier import classify_message
+from app.orchestrator.plan_agent import run_plan_agent
 from app.salesforce.oauth import build_oauth_start_url, has_user_oauth_identity
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ class Orchestrator:
         workspace_id: str = "",
         conversation_window: str = "",
         progress_callback: Callable[[str], None] | None = None,
+        plan_notification_callback: Callable[[str, str, str, str], None] | None = None,
+        plan_status_notification_callback: Callable[[str, str, str, str, str, str], None] | None = None,
     ) -> str:
         is_coworker = user_id == self.settings.slack_coworker_user_id
         classification = classify_message(
@@ -35,16 +38,31 @@ class Orchestrator:
         if classification.intent == "context_edit":
             return self._handle_context_edit(is_coworker=is_coworker, text=text)
 
-        if classification.intent == "write_request":
-            return (
-                "I detected a write request. Phase 2 approval workflow is next: "
-                "I will draft a plan and request coworker approval before any Salesforce write."
+        if classification.intent in {
+            "write_request",
+            "approval_response",
+            "role_scope_query",
+            "plan_management",
+        }:
+            return run_plan_agent(
+                settings=self.settings,
+                user_text=text,
+                workspace_id=workspace_id or "default",
+                requester_slack_user_id=user_id,
+                is_coworker=is_coworker,
+                parsed_intent=classification.intent,
+                parsed_intent_reason=classification.reason,
+                conversation_window=conversation_window,
+                notify_pending_plan_callback=plan_notification_callback,
+                notify_plan_status_callback=plan_status_notification_callback,
             )
 
         return self._handle_read_request(
             user_id=user_id,
             text=text,
             workspace_id=workspace_id,
+            parsed_intent=classification.intent,
+            parsed_intent_reason=classification.reason,
             conversation_window=conversation_window,
             progress_callback=progress_callback,
         )
@@ -58,11 +76,14 @@ class Orchestrator:
             f"will persist + summarize updates once the context store is added.\n\nInput: {text}"
         )
 
+
     def _handle_read_request(
         self,
         user_id: str,
         text: str,
         workspace_id: str = "",
+        parsed_intent: str = "",
+        parsed_intent_reason: str = "",
         conversation_window: str = "",
         progress_callback: Callable[[str], None] | None = None,
     ) -> str:
@@ -99,6 +120,8 @@ class Orchestrator:
                 text,
                 slack_user_id=user_id,
                 workspace_id=workspace_id or "default",
+                parsed_intent=parsed_intent,
+                parsed_intent_reason=parsed_intent_reason,
                 conversation_window=conversation_window,
                 progress_callback=progress_callback,
             )

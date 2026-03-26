@@ -11,16 +11,19 @@ CLASSIFIER_PROMPT = """
 You classify Slack DM requests for a Salesforce assistant.
 
 Return ONLY valid JSON:
-{"intent":"read_request|write_request|context_edit","reason":"short reason"}
+{"intent":"read_request|write_request|context_edit|approval_response|role_scope_query|plan_management","reason":"short reason"}
 
 Definitions:
 - read_request: asks for information; read-only Salesforce operations.
 - write_request: asks to create/update/delete Salesforce data or metadata.
 - context_edit: coworker is explicitly adding/modifying policy/context for the bot.
+- approval_response: coworker is approving/rejecting/requesting changes on a previously created plan.
+- role_scope_query: asks about user role, permissions, or what actions they are allowed to perform.
+- plan_management: asks to list/show/check/open pending plans or plan queue state.
 
 Rules:
 - Use best judgment from semantics, not keyword matching.
-- context_edit is only valid when is_coworker=true; otherwise choose read_request or write_request.
+- context_edit and approval_response are only valid when is_coworker=true; otherwise choose read_request or write_request.
 - Keep reason concise.
 """
 
@@ -73,13 +76,23 @@ def classify_message(
             reason=f"classifier_error_default_read: {type(exc).__name__}",
         )
 
-    allowed_intents = {"read_request", "write_request", "context_edit"}
+    allowed_intents = {
+        "read_request",
+        "write_request",
+        "context_edit",
+        "approval_response",
+        "role_scope_query",
+        "plan_management",
+    }
     if intent not in allowed_intents:
         intent = "read_request"
         reason = f"invalid_intent_from_model: {payload.get('intent')}"
     if intent == "context_edit" and not is_coworker:
         intent = "read_request"
         reason = "context_edit rejected for non-coworker"
+    if intent == "approval_response" and not is_coworker:
+        intent = "read_request"
+        reason = "approval_response rejected for non-coworker"
     return ClassificationResult(intent=intent, reason=reason)
 
 

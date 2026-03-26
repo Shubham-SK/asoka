@@ -52,6 +52,7 @@ Rules:
 - When any requested name is uncertain, do discovery first by listing/describing metadata and then use the exact discovered names.
 - Prefer discovery-first plans: identify valid objects/fields/values before constructing filtered queries.
 - If user phrasing is ambiguous, resolve it by discovery queries rather than assumptions.
+- For org-specific "current state" questions, execute at least one relevant tool call before returning final.
 """
 
 FORCED_FINAL_PROMPT = """
@@ -71,6 +72,8 @@ def run_read_agent(
     user_text: str,
     slack_user_id: str = "",
     workspace_id: str = "",
+    parsed_intent: str = "",
+    parsed_intent_reason: str = "",
     conversation_window: str = "",
     max_steps: int = 25,
     progress_callback: Callable[[str], None] | None = None,
@@ -81,9 +84,20 @@ def run_read_agent(
     context_block = (
         "Recent DM conversation window (oldest to newest):\n"
         f"{_truncate_text(conversation_window, 12000) if conversation_window else '<none>'}\n\n"
-        "Use this to resolve references like 'these accounts'."
+        "Use this only to resolve references like 'these accounts'. "
+        "If older context conflicts with the current request, prefer the current request."
+    )
+    intent_block = (
+        "Classifier context (authoritative routing hint):\n"
+        f"- intent: {parsed_intent or '<none>'}\n"
+        f"- reason: {_truncate_text(parsed_intent_reason, 800) if parsed_intent_reason else '<none>'}\n\n"
+        "Keep tool selection aligned with this intent/reason unless the user explicitly changes topic."
     )
     transcript: list[dict[str, str]] = [
+        {
+            "role": "user",
+            "content": intent_block,
+        },
         {
             "role": "user",
             "content": context_block,
@@ -97,6 +111,7 @@ def run_read_agent(
             ),
         }
     ]
+    enforced_tool_call_retry_used = False
 
     for step in range(max_steps):
         try:
@@ -112,9 +127,15 @@ def run_read_agent(
                 reason="I could not parse a valid next action from the model.",
             )
             if forced:
-                _emit_progress_update(events, progress_callback)
-                return _build_observability_blob(events) + "\n\n" + forced
-            _emit_progress_update(events, progress_callback)
+                _emit_progress_update(
+                    events, progress_callback, parsed_intent, parsed_intent_reason
+                )
+                return (
+                    _build_observability_blob(events, parsed_intent, parsed_intent_reason)
+                    + "\n\n"
+                    + forced
+                )
+            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             return _build_failure_summary(
                 user_text=user_text,
                 attempts=attempts,
@@ -125,8 +146,26 @@ def run_read_agent(
 
         if action_type == "final":
             answer = str(action.get("answer", "")).strip()
+            if (
+                not events
+                and not enforced_tool_call_retry_used
+                and _looks_like_org_state_question(user_text)
+            ):
+                enforced_tool_call_retry_used = True
+                transcript.append({"role": "assistant", "content": json.dumps(action)})
+                transcript.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You returned final without any tool calls. "
+                            "This request asks for current org state. "
+                            "Execute at least one relevant tool call first."
+                        ),
+                    }
+                )
+                continue
             if answer:
-                return _build_observability_blob(events) + "\n\n" + answer
+                return _build_observability_blob(events, parsed_intent, parsed_intent_reason) + "\n\n" + answer
             attempts.append(f"step {step + 1}: model returned empty final answer")
             return _build_failure_summary(
                 user_text=user_text,
@@ -166,7 +205,7 @@ def run_read_agent(
                 attempts.append(f"  -> error: missing object name")
                 events[-1]["status"] = "error"
                 events[-1]["output"] = "missing object name"
-                _emit_progress_update(events, progress_callback)
+                _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
                 continue
             try:
                 result = sf_describe_object(
@@ -197,7 +236,7 @@ def run_read_agent(
                         "content": f"Tool error (describe {object_name}): {type(exc).__name__}: {exc}",
                     }
                 )
-            _emit_progress_update(events, progress_callback)
+            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
         if action_type == "query":
@@ -229,7 +268,7 @@ def run_read_agent(
                 attempts.append("  -> error: missing SOQL")
                 events[-1]["status"] = "error"
                 events[-1]["output"] = "missing SOQL"
-                _emit_progress_update(events, progress_callback)
+                _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
                 continue
             try:
                 result = sf_query_read_only(
@@ -261,7 +300,7 @@ def run_read_agent(
                         "content": f"Tool error (query): {type(exc).__name__}: {exc}",
                     }
                 )
-            _emit_progress_update(events, progress_callback)
+            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
         if action_type == "tooling_query":
@@ -295,7 +334,7 @@ def run_read_agent(
                 attempts.append("  -> error: missing SOQL")
                 events[-1]["status"] = "error"
                 events[-1]["output"] = "missing SOQL"
-                _emit_progress_update(events, progress_callback)
+                _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
                 continue
             try:
                 result = sf_tooling_query(
@@ -327,7 +366,7 @@ def run_read_agent(
                         "content": f"Tool error (tooling_query): {type(exc).__name__}: {exc}",
                     }
                 )
-            _emit_progress_update(events, progress_callback)
+            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
         if action_type == "artifact_list_keys":
@@ -363,7 +402,7 @@ def run_read_agent(
                         "content": f"Tool error (artifact_list_keys): {type(exc).__name__}: {exc}",
                     }
                 )
-            _emit_progress_update(events, progress_callback)
+            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
         if action_type == "artifact_get_tree":
@@ -400,7 +439,7 @@ def run_read_agent(
                         "content": f"Tool error (artifact_get_tree): {type(exc).__name__}: {exc}",
                     }
                 )
-            _emit_progress_update(events, progress_callback)
+            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
         if action_type == "artifact_search_text":
@@ -439,7 +478,7 @@ def run_read_agent(
                         "content": f"Tool error (artifact_search_text): {type(exc).__name__}: {exc}",
                     }
                 )
-            _emit_progress_update(events, progress_callback)
+            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
         if action_type == "artifact_extract_path":
@@ -478,7 +517,7 @@ def run_read_agent(
                         "content": f"Tool error (artifact_extract_path): {type(exc).__name__}: {exc}",
                     }
                 )
-            _emit_progress_update(events, progress_callback)
+            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
         logger.warning("Unexpected agent action: %s", action)
@@ -499,9 +538,9 @@ def run_read_agent(
         reason=limit_reason,
     )
     if forced:
-        _emit_progress_update(events, progress_callback)
-        return _build_observability_blob(events) + "\n\n" + forced
-    _emit_progress_update(events, progress_callback)
+        _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
+        return _build_observability_blob(events, parsed_intent, parsed_intent_reason) + "\n\n" + forced
+    _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
     return _build_failure_summary(
         user_text=user_text,
         attempts=attempts,
@@ -577,7 +616,47 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
     try:
         return json.loads(raw_text)
     except json.JSONDecodeError as exc:
+        candidate = _extract_first_json_object_text(raw_text)
+        if candidate is not None:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
         raise RuntimeError(f"Invalid JSON from LLM: {raw_text}") from exc
+
+
+def _extract_first_json_object_text(raw_text: str) -> str | None:
+    start = raw_text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(raw_text)):
+        ch = raw_text[idx]
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw_text[start : idx + 1]
+    return None
 
 
 def _truncate_json(value: Any, max_chars: int = 8000) -> str:
@@ -624,8 +703,16 @@ def _build_failure_summary(user_text: str, attempts: list[str], reason: str) -> 
     return "\n".join(lines)
 
 
-def _build_observability_blob(events: list[dict[str, Any]]) -> str:
+def _build_observability_blob(
+    events: list[dict[str, Any]],
+    parsed_intent: str = "",
+    parsed_intent_reason: str = "",
+) -> str:
     lines = ["Execution trace"]
+    if parsed_intent:
+        lines.append(f"- Intent parse: {parsed_intent}")
+    if parsed_intent_reason:
+        lines.append(f"- Intent reason: {parsed_intent_reason}")
     if not events:
         lines.append("- No tool calls were executed.")
         return "```\n" + "\n".join(lines) + "\n```"
@@ -726,13 +813,44 @@ def _record_count(value: Any) -> int:
     return 0
 
 
+def _looks_like_org_state_question(user_text: str) -> bool:
+    text = user_text.strip().lower()
+    cues = (
+        "any ",
+        "current",
+        "as it stands",
+        "how many",
+        "what are",
+        "show",
+        "list",
+        "settings",
+        "validation",
+        "enforcement",
+        "rule",
+        "minimum",
+        "maximum",
+        "field",
+        "opportunity",
+        "account",
+        "case",
+        "pipeline",
+        "deals",
+    )
+    return any(cue in text for cue in cues)
+
+
 def _emit_progress_update(
     events: list[dict[str, Any]],
     progress_callback: Callable[[str], None] | None,
+    parsed_intent: str = "",
+    parsed_intent_reason: str = "",
 ) -> None:
     if progress_callback is None or not events:
         return
     try:
-        progress_callback(_build_observability_blob(events) + "\n\n_Working..._")
+        progress_callback(
+            _build_observability_blob(events, parsed_intent, parsed_intent_reason)
+            + "\n\n_Working..._"
+        )
     except Exception as exc:
         logger.info("Progress callback failed: %s", exc)

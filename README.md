@@ -73,7 +73,13 @@ In your Slack app config:
     - Fallback integration credentials from env
   - If Claude or Salesforce config is missing/invalid, bot returns a setup error.
 - Write request:
-  - Bot detects write intent and responds with Phase 2 approval-gate placeholder.
+  - Bot detects write intent and stores a DB-backed execution plan intent.
+  - End-user write plans are `pending_approval` for coworker review.
+  - Coworker write plans are created and immediately marked `approved`.
+  - Coworker approval commands:
+    - `approve plan <plan_id>`
+    - `reject plan <plan_id> because <reason>`
+    - `request changes plan <plan_id> because <reason>`
 - Context edit:
   - Coworker-only check wired; persistence comes in later phases.
 

@@ -6,10 +6,11 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.enums import AuthType
+from app.db.enums import AuthType, PlanStatus
 from app.db.models import (
     Conversation,
     ConversationMessage,
+    ExecutionPlan,
     SlackSalesforceIdentity,
     User,
     UserContextEntry,
@@ -222,3 +223,183 @@ def load_conversation_window(
         role = "assistant" if msg.role == "assistant" else "user"
         lines.append(f"{role}: {msg.text}")
     return "\n".join(lines)
+
+
+def create_execution_plan(
+    db: Session,
+    workspace_id: str,
+    requester_slack_user_id: str,
+    summary: str,
+    operations: list[dict[str, Any]],
+    assumptions: list[dict[str, Any]] | None = None,
+    safety_checks: list[dict[str, Any]] | None = None,
+    status: PlanStatus = PlanStatus.pending_approval,
+) -> ExecutionPlan:
+    workspace, _ = ensure_workspace_and_user(
+        db,
+        workspace_id=workspace_id,
+        slack_user_id=requester_slack_user_id,
+    )
+    plan = ExecutionPlan(
+        workspace_id=workspace.id,
+        requester_slack_user_id=requester_slack_user_id,
+        status=status,
+        summary=summary,
+        assumptions_json=assumptions or [],
+        operations_json=operations,
+        safety_checks_json=safety_checks or [],
+    )
+    db.add(plan)
+    db.flush()
+    return plan
+
+
+def get_execution_plan_for_workspace(
+    db: Session,
+    workspace_id: str,
+    plan_id: str,
+) -> ExecutionPlan | None:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        return None
+    return db.scalar(
+        select(ExecutionPlan).where(
+            ExecutionPlan.id == plan_id,
+            ExecutionPlan.workspace_id == workspace.id,
+        )
+    )
+
+
+def set_execution_plan_status(
+    db: Session,
+    workspace_id: str,
+    plan_id: str,
+    status: PlanStatus,
+    reason: str = "",
+    actor_slack_user_id: str = "",
+    allowed_from_statuses: list[PlanStatus] | None = None,
+) -> ExecutionPlan | None:
+    plan = get_execution_plan_for_workspace(db=db, workspace_id=workspace_id, plan_id=plan_id)
+    if plan is None:
+        return None
+    previous_status = plan.status
+    if allowed_from_statuses and previous_status not in allowed_from_statuses:
+        raise ValueError(
+            f"Invalid status transition: {previous_status.value} -> {status.value} for plan {plan_id}"
+        )
+    if not _is_allowed_plan_transition(previous_status, status):
+        raise ValueError(
+            f"Disallowed status transition: {previous_status.value} -> {status.value} for plan {plan_id}"
+        )
+    plan.status = status
+    audit_entry = {
+        "actor_slack_user_id": actor_slack_user_id,
+        "previous_status": previous_status.value,
+        "status": status.value,
+        "reason": reason,
+        "at": datetime.utcnow().isoformat(),
+    }
+    checks = list(plan.safety_checks_json or [])
+    checks.append(audit_entry)
+    plan.safety_checks_json = checks
+    db.flush()
+    return plan
+
+
+def list_pending_plan_summaries(
+    db: Session,
+    workspace_id: str,
+    requester_slack_user_id: str | None = None,
+    limit: int = 25,
+) -> list[dict[str, str]]:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        return []
+
+    stmt = (
+        select(ExecutionPlan).where(
+            ExecutionPlan.workspace_id == workspace.id,
+            ExecutionPlan.status == PlanStatus.pending_approval,
+        )
+    )
+    if requester_slack_user_id:
+        stmt = stmt.where(ExecutionPlan.requester_slack_user_id == requester_slack_user_id)
+    stmt = stmt.order_by(ExecutionPlan.created_at.asc()).limit(max(1, min(limit, 100)))
+    plans = db.scalars(stmt).all()
+    out: list[dict[str, str]] = []
+    for plan in plans:
+        out.append(
+            {
+                "id": plan.id,
+                "requester_slack_user_id": plan.requester_slack_user_id,
+                "summary": plan.summary,
+                "created_at": plan.created_at.isoformat(),
+                "status": plan.status.value,
+                "rejection_reason": _extract_latest_reason(plan, PlanStatus.denied),
+            }
+        )
+    return out
+
+
+def list_plan_summaries(
+    db: Session,
+    workspace_id: str,
+    statuses: list[PlanStatus] | None = None,
+    requester_slack_user_id: str | None = None,
+    limit: int = 25,
+) -> list[dict[str, str]]:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        return []
+
+    stmt = select(ExecutionPlan).where(ExecutionPlan.workspace_id == workspace.id)
+    if statuses:
+        stmt = stmt.where(ExecutionPlan.status.in_(statuses))
+    if requester_slack_user_id:
+        stmt = stmt.where(ExecutionPlan.requester_slack_user_id == requester_slack_user_id)
+
+    stmt = stmt.order_by(ExecutionPlan.created_at.desc()).limit(max(1, min(limit, 100)))
+    plans = db.scalars(stmt).all()
+
+    out: list[dict[str, str]] = []
+    for plan in plans:
+        out.append(
+            {
+                "id": plan.id,
+                "requester_slack_user_id": plan.requester_slack_user_id,
+                "summary": plan.summary,
+                "created_at": plan.created_at.isoformat(),
+                "status": plan.status.value,
+                "rejection_reason": _extract_latest_reason(plan, PlanStatus.denied),
+            }
+        )
+    return out
+
+
+def _extract_latest_reason(plan: ExecutionPlan, status: PlanStatus) -> str:
+    checks = plan.safety_checks_json
+    if not isinstance(checks, list):
+        return ""
+    for item in reversed(checks):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status", "")).strip().lower() != status.value:
+            continue
+        reason = str(item.get("reason", "")).strip()
+        if reason:
+            return reason
+    return ""
+
+
+def _is_allowed_plan_transition(from_status: PlanStatus, to_status: PlanStatus) -> bool:
+    if from_status == to_status:
+        return True
+    allowed_transitions: dict[PlanStatus, set[PlanStatus]] = {
+        PlanStatus.draft: {PlanStatus.pending_approval},
+        PlanStatus.pending_approval: {PlanStatus.approved, PlanStatus.denied},
+        PlanStatus.approved: {PlanStatus.executed, PlanStatus.failed},
+        PlanStatus.denied: {PlanStatus.pending_approval},
+        PlanStatus.executed: set(),
+        PlanStatus.failed: {PlanStatus.pending_approval},
+    }
+    return to_status in allowed_transitions.get(from_status, set())

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     slack_signing_secret: str = ""
     slack_app_token: str = ""
     slack_coworker_user_id: str = ""
+    plan_notify_coworker_on_create: bool = True
 
     llm_provider: str = "anthropic"
     llm_model: str = "claude-3-5-sonnet-latest"
