@@ -70,7 +70,7 @@ Rules:
 - Hard limits:
   - facts: at most 12
   - hypotheses: at most 6
-  - questions: 5
+  - questions: 2 to 6 (prefer 3 to 5 when meaningful gaps exist)
 - Priority order for fact extraction (highest first):
   1) Examine validation rules and hard constraints found in salesforce. Establish facts for each.
   2) Examine feature behavior and object/field descriptions.
@@ -93,7 +93,8 @@ Rules:
   - custom fields (`__c`)
   - custom automation or integration-specific fields
   - ask what business process each custom item supports and who owns its definition
-- Generate exactly 1 high-quality question from the highest-value hypothesis/uncertainty gap.
+- Generate multiple high-quality questions that cover distinct uncertainty gaps.
+- Avoid near-duplicate questions; each should target a different policy or semantic ambiguity.
 - If validation-rule details are present in discovery context, convert them into concrete `kind="rule"` facts.
 - Do not ask questions that simply request the content of validation rules already provided in context.
 """
@@ -359,9 +360,21 @@ def _persist_ingestion_document(
 
 def _ingestion_caps(max_items: int) -> tuple[int, int, int]:
     budget = max(1, max_items)
-    facts = min(12, max(4, budget // 2))
-    questions = 1
-    hypotheses = min(6, max(1, budget - facts - questions))
+    facts = min(12, max(3, int(budget * 0.5)))
+    questions = min(6, max(2, int(budget * 0.25)))
+    remaining = budget - facts - questions
+    if remaining < 1:
+        deficit = 1 - remaining
+        reducible_facts = max(0, facts - 3)
+        cut_facts = min(deficit, reducible_facts)
+        facts -= cut_facts
+        deficit -= cut_facts
+        if deficit > 0:
+            reducible_questions = max(0, questions - 2)
+            cut_questions = min(deficit, reducible_questions)
+            questions -= cut_questions
+        remaining = budget - facts - questions
+    hypotheses = min(6, max(1, remaining))
     return facts, hypotheses, questions
 
 
@@ -571,18 +584,18 @@ def _extract_knowledge_in_stages(
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     stage_plan = [
-        ("validation_rules", "validation_rule", 1200),
-        ("feature_behavior", "feature_behavior", 1000),
-        ("naming_conventions", "naming_convention", 900),
-        ("automation_tests", "automation_test", 1000),
+        ("validation_rules", "validation_rule", 1200, 1),
+        ("feature_behavior", "feature_behavior", 1000, 2),
+        ("naming_conventions", "naming_convention", 900, 2),
+        ("automation_tests", "automation_test", 1000, 2),
     ]
     merged: dict[str, Any] = {"facts": [], "hypotheses": [], "questions": []}
     parsed_any = False
-    for stage_name, source_label, stage_tokens in stage_plan:
+    for stage_name, source_label, stage_tokens, question_limit in stage_plan:
         context = _compose_stage_context(stage_name=stage_name, discovery_contexts=discovery_contexts)
         prompt = _build_stage_ingestion_prompt(
             source_label=source_label,
-            allow_question=stage_name == "automation_tests",
+            question_limit=question_limit,
         )
         payload = (
             "Request context:\n"
@@ -738,10 +751,13 @@ def _compose_stage_context(stage_name: str, discovery_contexts: dict[str, str]) 
     return ""
 
 
-def _build_stage_ingestion_prompt(source_label: str, allow_question: bool) -> str:
-    question_instruction = (
-        "- questions: exactly 1 high-value gap question." if allow_question else "- questions: [] (none)."
-    )
+def _build_stage_ingestion_prompt(source_label: str, question_limit: int) -> str:
+    if question_limit <= 0:
+        question_instruction = "- questions: [] (none)."
+    elif question_limit == 1:
+        question_instruction = "- questions: at most 1 high-value gap question."
+    else:
+        question_instruction = f"- questions: at most {question_limit} high-value gap questions."
     return f"""
 You extract structured Salesforce knowledge from a completed read-agent response.
 
@@ -795,6 +811,7 @@ Rules:
   (when to use each field, business intent, and edge-case boundaries).
 - If custom items are present, make the question explicitly about custom items first
   (custom objects/fields, their intended usage, ownership, and constraints).
+- Prefer multiple concise, non-overlapping questions over one broad generic question.
 """
 
 
