@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from app.agent.tools import (
     artifact_extract_path,
@@ -69,8 +69,11 @@ Requirements:
 def run_read_agent(
     settings: Settings,
     user_text: str,
+    slack_user_id: str = "",
+    workspace_id: str = "",
     conversation_window: str = "",
     max_steps: int = 25,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> str:
     client = get_claude_client()
     attempts: list[str] = []
@@ -109,7 +112,9 @@ def run_read_agent(
                 reason="I could not parse a valid next action from the model.",
             )
             if forced:
+                _emit_progress_update(events, progress_callback)
                 return _build_observability_blob(events) + "\n\n" + forced
+            _emit_progress_update(events, progress_callback)
             return _build_failure_summary(
                 user_text=user_text,
                 attempts=attempts,
@@ -161,9 +166,14 @@ def run_read_agent(
                 attempts.append(f"  -> error: missing object name")
                 events[-1]["status"] = "error"
                 events[-1]["output"] = "missing object name"
+                _emit_progress_update(events, progress_callback)
                 continue
             try:
-                result = sf_describe_object(object_name)
+                result = sf_describe_object(
+                    object_name,
+                    slack_user_id=slack_user_id or None,
+                    workspace_id=workspace_id or None,
+                )
                 summary = _summarize_describe_result(result)
                 materialized = _materialize_result_for_model(
                     result=result,
@@ -187,6 +197,7 @@ def run_read_agent(
                         "content": f"Tool error (describe {object_name}): {type(exc).__name__}: {exc}",
                     }
                 )
+            _emit_progress_update(events, progress_callback)
             continue
 
         if action_type == "query":
@@ -218,9 +229,14 @@ def run_read_agent(
                 attempts.append("  -> error: missing SOQL")
                 events[-1]["status"] = "error"
                 events[-1]["output"] = "missing SOQL"
+                _emit_progress_update(events, progress_callback)
                 continue
             try:
-                result = sf_query_read_only(soql)
+                result = sf_query_read_only(
+                    soql,
+                    slack_user_id=slack_user_id or None,
+                    workspace_id=workspace_id or None,
+                )
                 summary = _summarize_query_result(result)
                 materialized = _materialize_result_for_model(
                     result=result,
@@ -245,6 +261,7 @@ def run_read_agent(
                         "content": f"Tool error (query): {type(exc).__name__}: {exc}",
                     }
                 )
+            _emit_progress_update(events, progress_callback)
             continue
 
         if action_type == "tooling_query":
@@ -278,9 +295,14 @@ def run_read_agent(
                 attempts.append("  -> error: missing SOQL")
                 events[-1]["status"] = "error"
                 events[-1]["output"] = "missing SOQL"
+                _emit_progress_update(events, progress_callback)
                 continue
             try:
-                result = sf_tooling_query(soql)
+                result = sf_tooling_query(
+                    soql,
+                    slack_user_id=slack_user_id or None,
+                    workspace_id=workspace_id or None,
+                )
                 summary = _summarize_query_result(result)
                 materialized = _materialize_result_for_model(
                     result=result,
@@ -305,6 +327,7 @@ def run_read_agent(
                         "content": f"Tool error (tooling_query): {type(exc).__name__}: {exc}",
                     }
                 )
+            _emit_progress_update(events, progress_callback)
             continue
 
         if action_type == "artifact_list_keys":
@@ -340,6 +363,7 @@ def run_read_agent(
                         "content": f"Tool error (artifact_list_keys): {type(exc).__name__}: {exc}",
                     }
                 )
+            _emit_progress_update(events, progress_callback)
             continue
 
         if action_type == "artifact_get_tree":
@@ -376,6 +400,7 @@ def run_read_agent(
                         "content": f"Tool error (artifact_get_tree): {type(exc).__name__}: {exc}",
                     }
                 )
+            _emit_progress_update(events, progress_callback)
             continue
 
         if action_type == "artifact_search_text":
@@ -414,6 +439,7 @@ def run_read_agent(
                         "content": f"Tool error (artifact_search_text): {type(exc).__name__}: {exc}",
                     }
                 )
+            _emit_progress_update(events, progress_callback)
             continue
 
         if action_type == "artifact_extract_path":
@@ -452,6 +478,7 @@ def run_read_agent(
                         "content": f"Tool error (artifact_extract_path): {type(exc).__name__}: {exc}",
                     }
                 )
+            _emit_progress_update(events, progress_callback)
             continue
 
         logger.warning("Unexpected agent action: %s", action)
@@ -472,7 +499,9 @@ def run_read_agent(
         reason=limit_reason,
     )
     if forced:
+        _emit_progress_update(events, progress_callback)
         return _build_observability_blob(events) + "\n\n" + forced
+    _emit_progress_update(events, progress_callback)
     return _build_failure_summary(
         user_text=user_text,
         attempts=attempts,
@@ -596,10 +625,10 @@ def _build_failure_summary(user_text: str, attempts: list[str], reason: str) -> 
 
 
 def _build_observability_blob(events: list[dict[str, Any]]) -> str:
-    lines = ["*Execution trace*"]
+    lines = ["Execution trace"]
     if not events:
         lines.append("- No tool calls were executed.")
-        return "\n".join(lines)
+        return "```\n" + "\n".join(lines) + "\n```"
 
     for event in events:
         lines.append(
@@ -615,7 +644,7 @@ def _build_observability_blob(events: list[dict[str, Any]]) -> str:
             lines.append("  - First rows (up to 10):")
             for row in row_preview:
                 lines.append(f"    - {row}")
-    return "\n".join(lines)
+    return "```\n" + "\n".join(lines) + "\n```"
 
 
 def _extract_rows_preview(result: dict[str, Any], max_rows: int = 10) -> list[str]:
@@ -695,3 +724,15 @@ def _record_count(value: Any) -> int:
         if isinstance(records, list):
             return len(records)
     return 0
+
+
+def _emit_progress_update(
+    events: list[dict[str, Any]],
+    progress_callback: Callable[[str], None] | None,
+) -> None:
+    if progress_callback is None or not events:
+        return
+    try:
+        progress_callback(_build_observability_blob(events) + "\n\n_Working..._")
+    except Exception as exc:
+        logger.info("Progress callback failed: %s", exc)

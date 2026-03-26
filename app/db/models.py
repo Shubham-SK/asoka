@@ -29,6 +29,7 @@ class Workspace(Base):
     )
 
     users: Mapped[list["User"]] = relationship(back_populates="workspace")
+    conversations: Mapped[list["Conversation"]] = relationship(back_populates="workspace")
 
 
 class User(Base):
@@ -49,6 +50,8 @@ class User(Base):
 
     workspace: Mapped["Workspace"] = relationship(back_populates="users")
     sf_identities: Mapped[list["SlackSalesforceIdentity"]] = relationship(back_populates="user")
+    context_entries: Mapped[list["UserContextEntry"]] = relationship(back_populates="user")
+    conversations: Mapped[list["Conversation"]] = relationship(back_populates="user")
 
 
 class SlackSalesforceIdentity(Base):
@@ -97,6 +100,78 @@ class SlackSalesforceIdentity(Base):
     )
 
     user: Mapped["User | None"] = relationship(back_populates="sf_identities")
+
+
+class UserContextEntry(Base):
+    __tablename__ = "user_context_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "slack_user_id",
+            "context_key",
+            name="uq_user_context_workspace_user_key",
+        ),
+        Index("ix_user_context_workspace_user", "workspace_id", "slack_user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
+    slack_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    context_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    context_value_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    user: Mapped["User | None"] = relationship(back_populates="context_entries")
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "slack_user_id",
+            "slack_channel_id",
+            name="uq_conversation_workspace_user_channel",
+        ),
+        Index("ix_conversation_workspace_user", "workspace_id", "slack_user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
+    slack_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    slack_channel_id: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    workspace: Mapped["Workspace"] = relationship(back_populates="conversations")
+    user: Mapped["User | None"] = relationship(back_populates="conversations")
+    messages: Mapped[list["ConversationMessage"]] = relationship(back_populates="conversation")
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+    __table_args__ = (
+        Index("ix_message_conversation_created", "conversation_id", "created_at"),
+        Index("ix_message_workspace_user", "workspace_id", "slack_user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    slack_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)  # user|assistant
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    slack_ts: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 
 
 class ExecutionPlan(Base):

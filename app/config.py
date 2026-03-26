@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     app_env: str = "local"
     log_level: str = "INFO"
     port: int = 8000
+    app_base_url: str = "http://localhost:8000"
     database_url: str = "sqlite:///./app.db"
 
     slack_bot_token: str = ""
@@ -27,6 +28,8 @@ class Settings(BaseSettings):
     salesforce_oauth_client_id: str = ""
     salesforce_oauth_client_secret: str = ""
     salesforce_oauth_redirect_uri: str = ""
+    oauth_state_secret: str = ""
+    token_encryption_key: str = ""
 
     @property
     def slack_enabled(self) -> bool:
@@ -36,6 +39,14 @@ class Settings(BaseSettings):
     def salesforce_enabled(self) -> bool:
         return bool(
             self.salesforce_username and self.salesforce_password and self.salesforce_security_token
+        )
+
+    @property
+    def salesforce_oauth_enabled(self) -> bool:
+        return bool(
+            self.salesforce_oauth_client_id
+            and self.salesforce_oauth_client_secret
+            and self.salesforce_oauth_redirect_uri
         )
 
     @property
