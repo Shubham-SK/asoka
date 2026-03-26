@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     slack_app_token: str = ""
     slack_coworker_user_id: str = ""
     plan_notify_coworker_on_create: bool = True
+    plan_backend: str = "manual"
+    plan_execute_on_approve: bool = True
 
     llm_provider: str = "anthropic"
     llm_model: str = "claude-3-5-sonnet-latest"
@@ -39,6 +41,8 @@ class Settings(BaseSettings):
     salesforce_mcp_env_json: str = "{}"
     salesforce_mcp_init_timeout_seconds: int = 20
     salesforce_mcp_tool_timeout_seconds: int = 90
+    knowledge_ingestion_enabled: bool = True
+    knowledge_ingestion_max_items: int = 30
 
     @property
     def slack_enabled(self) -> bool:

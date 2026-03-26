@@ -7,7 +7,16 @@ from sqlalchemy import DateTime, Enum, ForeignKey, Index, JSON, String, Text, Un
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
-from app.db.enums import AuthType, PlanStatus, UserRole, WorkspaceStatus
+from app.db.enums import (
+    AuthType,
+    ConfidenceTier,
+    KnowledgeKind,
+    KnowledgeLifecycleStatus,
+    KnowledgeQuestionStatus,
+    PlanStatus,
+    UserRole,
+    WorkspaceStatus,
+)
 
 
 def _uuid() -> str:
@@ -187,6 +196,65 @@ class ExecutionPlan(Base):
     safety_checks_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     plan_version: Mapped[int] = mapped_column(default=1, nullable=False)
     plan_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+
+class KnowledgeItem(Base):
+    __tablename__ = "knowledge_items"
+    __table_args__ = (
+        Index(
+            "ix_knowledge_workspace_kind_rank",
+            "workspace_id",
+            "kind",
+            "confidence_rank",
+            "updated_at",
+        ),
+        Index(
+            "ix_knowledge_workspace_object_rank",
+            "workspace_id",
+            "sf_object_api_name",
+            "confidence_rank",
+        ),
+        Index(
+            "ix_knowledge_workspace_question_status",
+            "workspace_id",
+            "question_status",
+            "updated_at",
+        ),
+        Index(
+            "ix_knowledge_workspace_canonical_key",
+            "workspace_id",
+            "salesforce_org_key",
+            "canonical_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    salesforce_org_key: Mapped[str] = mapped_column(String(128), default="default", nullable=False)
+    kind: Mapped[KnowledgeKind] = mapped_column(Enum(KnowledgeKind), nullable=False)
+    confidence_tier: Mapped[ConfidenceTier] = mapped_column(Enum(ConfidenceTier), nullable=False)
+    confidence_rank: Mapped[int] = mapped_column(nullable=False, default=1)
+    confidence_score: Mapped[float] = mapped_column(nullable=False, default=0.5)
+    usage_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    content_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    provenance_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    canonical_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    sf_object_api_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    sf_field_api_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lifecycle_status: Mapped[KnowledgeLifecycleStatus] = mapped_column(
+        Enum(KnowledgeLifecycleStatus),
+        nullable=False,
+        default=KnowledgeLifecycleStatus.active,
+    )
+    supersedes_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_items.id"), nullable=True)
+    question_status: Mapped[KnowledgeQuestionStatus | None] = mapped_column(
+        Enum(KnowledgeQuestionStatus), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False

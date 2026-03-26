@@ -11,7 +11,7 @@ CLASSIFIER_PROMPT = """
 You classify Slack DM requests for a Salesforce assistant.
 
 Return ONLY valid JSON:
-{"intent":"read_request|write_request|context_edit|approval_response|role_scope_query|plan_management","reason":"short reason"}
+{"intent":"read_request|write_request|context_edit|approval_response|role_scope_query|plan_management|knowledge_ingestion","reason":"short reason"}
 
 Definitions:
 - read_request: asks for information; read-only Salesforce operations.
@@ -20,10 +20,11 @@ Definitions:
 - approval_response: coworker is approving/rejecting/requesting changes on a previously created plan.
 - role_scope_query: asks about user role, permissions, or what actions they are allowed to perform.
 - plan_management: asks to list/show/check/open pending plans or plan queue state.
+- knowledge_ingestion: coworker explicitly asks to ingest/update structured knowledge from recent outputs/context.
 
 Rules:
 - Use best judgment from semantics, not keyword matching.
-- context_edit and approval_response are only valid when is_coworker=true; otherwise choose read_request or write_request.
+- context_edit, approval_response, and knowledge_ingestion are only valid when is_coworker=true; otherwise choose read_request or write_request.
 - Keep reason concise.
 """
 
@@ -83,6 +84,7 @@ def classify_message(
         "approval_response",
         "role_scope_query",
         "plan_management",
+        "knowledge_ingestion",
     }
     if intent not in allowed_intents:
         intent = "read_request"
@@ -93,6 +95,9 @@ def classify_message(
     if intent == "approval_response" and not is_coworker:
         intent = "read_request"
         reason = "approval_response rejected for non-coworker"
+    if intent == "knowledge_ingestion" and not is_coworker:
+        intent = "read_request"
+        reason = "knowledge_ingestion rejected for non-coworker"
     return ClassificationResult(intent=intent, reason=reason)
 
 

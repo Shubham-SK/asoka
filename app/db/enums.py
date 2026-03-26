@@ -25,3 +25,29 @@ class PlanStatus(str, enum.Enum):
 class AuthType(str, enum.Enum):
     integration_credentials = "integration_credentials"
     oauth_user = "oauth_user"
+
+
+class KnowledgeKind(str, enum.Enum):
+    fact = "fact"
+    rule = "rule"
+    trend = "trend"
+    hypothesis = "hypothesis"
+    question = "question"
+
+
+class ConfidenceTier(str, enum.Enum):
+    strict_violation = "strict_violation"
+    similar_past_approval = "similar_past_approval"
+    observed_trend = "observed_trend"
+    coworker_context = "coworker_context"
+
+
+class KnowledgeLifecycleStatus(str, enum.Enum):
+    active = "active"
+    superseded = "superseded"
+
+
+class KnowledgeQuestionStatus(str, enum.Enum):
+    open = "open"
+    resolved = "resolved"
+    dismissed = "dismissed"

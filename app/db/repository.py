@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.enums import AuthType, PlanStatus
+from app.db.enums import (
+    AuthType,
+    ConfidenceTier,
+    KnowledgeKind,
+    KnowledgeLifecycleStatus,
+    KnowledgeQuestionStatus,
+    PlanStatus,
+)
 from app.db.models import (
     Conversation,
     ConversationMessage,
     ExecutionPlan,
+    KnowledgeItem,
     SlackSalesforceIdentity,
     User,
     UserContextEntry,
@@ -248,6 +258,7 @@ def create_execution_plan(
         assumptions_json=assumptions or [],
         operations_json=operations,
         safety_checks_json=safety_checks or [],
+        plan_fingerprint=_compute_plan_fingerprint(summary=summary, operations=operations),
     )
     db.add(plan)
     db.flush()
@@ -391,6 +402,169 @@ def _extract_latest_reason(plan: ExecutionPlan, status: PlanStatus) -> str:
     return ""
 
 
+def create_knowledge_item(
+    db: Session,
+    workspace_id: str,
+    kind: KnowledgeKind,
+    confidence_tier: ConfidenceTier,
+    title: str,
+    content: dict[str, Any],
+    provenance: dict[str, Any] | None = None,
+    salesforce_org_key: str = "default",
+    confidence_score: float = 0.5,
+    canonical_key: str | None = None,
+    sf_object_api_name: str | None = None,
+    sf_field_api_name: str | None = None,
+    question_status: KnowledgeQuestionStatus | None = None,
+) -> KnowledgeItem:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        workspace = Workspace(slack_team_id=workspace_id, name=workspace_id)
+        db.add(workspace)
+        db.flush()
+    item = KnowledgeItem(
+        workspace_id=workspace.id,
+        salesforce_org_key=salesforce_org_key,
+        kind=kind,
+        confidence_tier=confidence_tier,
+        confidence_rank=_confidence_rank(confidence_tier),
+        confidence_score=max(0.0, min(confidence_score, 1.0)),
+        title=title.strip()[:500] or "Untitled knowledge item",
+        content_json=content or {},
+        provenance_json=provenance or {},
+        canonical_key=(canonical_key or "").strip() or None,
+        sf_object_api_name=(sf_object_api_name or "").strip() or None,
+        sf_field_api_name=(sf_field_api_name or "").strip() or None,
+        lifecycle_status=KnowledgeLifecycleStatus.active,
+        question_status=question_status,
+    )
+    db.add(item)
+    db.flush()
+    return item
+
+
+def list_knowledge_for_retrieval(
+    db: Session,
+    workspace_id: str,
+    kinds: list[KnowledgeKind] | None = None,
+    min_confidence_rank: int | None = None,
+    sf_object_api_name: str | None = None,
+    limit: int = 25,
+) -> list[KnowledgeItem]:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        return []
+    stmt = select(KnowledgeItem).where(
+        KnowledgeItem.workspace_id == workspace.id,
+        KnowledgeItem.lifecycle_status == KnowledgeLifecycleStatus.active,
+    )
+    if kinds:
+        stmt = stmt.where(KnowledgeItem.kind.in_(kinds))
+    if min_confidence_rank is not None:
+        normalized_rank = min(max(1, int(min_confidence_rank)), 4)
+        stmt = stmt.where(KnowledgeItem.confidence_rank >= normalized_rank)
+    if sf_object_api_name:
+        stmt = stmt.where(KnowledgeItem.sf_object_api_name == sf_object_api_name)
+    stmt = stmt.order_by(KnowledgeItem.confidence_rank.desc(), KnowledgeItem.updated_at.desc()).limit(
+        max(1, min(limit, 100))
+    )
+    return list(db.scalars(stmt).all())
+
+
+def increment_knowledge_usage_counts(
+    db: Session,
+    workspace_id: str,
+    knowledge_item_ids: list[str],
+) -> int:
+    if not knowledge_item_ids:
+        return 0
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        return 0
+    unique_ids = list({item_id for item_id in knowledge_item_ids if str(item_id).strip()})
+    if not unique_ids:
+        return 0
+    stmt = select(KnowledgeItem).where(
+        KnowledgeItem.workspace_id == workspace.id,
+        KnowledgeItem.id.in_(unique_ids),
+        KnowledgeItem.lifecycle_status == KnowledgeLifecycleStatus.active,
+    )
+    items = list(db.scalars(stmt).all())
+    for item in items:
+        item.usage_count = int(item.usage_count or 0) + 1
+    db.flush()
+    return len(items)
+
+
+def list_open_policy_questions(
+    db: Session,
+    workspace_id: str,
+    limit: int = 25,
+) -> list[KnowledgeItem]:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        return []
+    stmt = (
+        select(KnowledgeItem)
+        .where(
+            KnowledgeItem.workspace_id == workspace.id,
+            KnowledgeItem.kind == KnowledgeKind.question,
+            KnowledgeItem.lifecycle_status == KnowledgeLifecycleStatus.active,
+            KnowledgeItem.question_status == KnowledgeQuestionStatus.open,
+        )
+        .order_by(KnowledgeItem.updated_at.desc())
+        .limit(max(1, min(limit, 100)))
+    )
+    return list(db.scalars(stmt).all())
+
+
+def resolve_or_supersede_by_canonical_key(
+    db: Session,
+    workspace_id: str,
+    salesforce_org_key: str,
+    kind: KnowledgeKind,
+    canonical_key: str,
+    replacement_content: dict[str, Any],
+    replacement_title: str,
+    confidence_tier: ConfidenceTier,
+    confidence_score: float,
+    provenance: dict[str, Any] | None = None,
+) -> KnowledgeItem:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        workspace = Workspace(slack_team_id=workspace_id, name=workspace_id)
+        db.add(workspace)
+        db.flush()
+    existing = db.scalar(
+        select(KnowledgeItem).where(
+            KnowledgeItem.workspace_id == workspace.id,
+            KnowledgeItem.salesforce_org_key == salesforce_org_key,
+            KnowledgeItem.kind == kind,
+            KnowledgeItem.canonical_key == canonical_key,
+            KnowledgeItem.lifecycle_status == KnowledgeLifecycleStatus.active,
+        )
+    )
+    supersedes_id: str | None = None
+    if existing is not None:
+        existing.lifecycle_status = KnowledgeLifecycleStatus.superseded
+        supersedes_id = existing.id
+    item = create_knowledge_item(
+        db=db,
+        workspace_id=workspace_id,
+        kind=kind,
+        confidence_tier=confidence_tier,
+        confidence_score=confidence_score,
+        title=replacement_title,
+        content=replacement_content,
+        provenance=provenance or {},
+        salesforce_org_key=salesforce_org_key,
+        canonical_key=canonical_key,
+    )
+    item.supersedes_id = supersedes_id
+    db.flush()
+    return item
+
+
 def _is_allowed_plan_transition(from_status: PlanStatus, to_status: PlanStatus) -> bool:
     if from_status == to_status:
         return True
@@ -403,3 +577,19 @@ def _is_allowed_plan_transition(from_status: PlanStatus, to_status: PlanStatus) 
         PlanStatus.failed: {PlanStatus.pending_approval},
     }
     return to_status in allowed_transitions.get(from_status, set())
+
+
+def _compute_plan_fingerprint(summary: str, operations: list[dict[str, Any]]) -> str:
+    payload = {"summary": summary.strip(), "operations": operations}
+    normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _confidence_rank(tier: ConfidenceTier) -> int:
+    mapping = {
+        ConfidenceTier.strict_violation: 1,
+        ConfidenceTier.similar_past_approval: 2,
+        ConfidenceTier.observed_trend: 3,
+        ConfidenceTier.coworker_context: 4,
+    }
+    return mapping.get(tier, 1)
