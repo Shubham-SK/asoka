@@ -417,8 +417,6 @@ def _build_observability_blob(
         lines.append(
             f"- Step {event['step']} [{event['type']} | {event['status']}]: {event['reason']}"
         )
-        lines.append(f"  - Input: {event['input']}")
-        lines.append(f"  - Output: {event['output']}")
     return "```\n" + "\n".join(lines) + "\n```"
 
 

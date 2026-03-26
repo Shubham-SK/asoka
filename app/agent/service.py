@@ -721,16 +721,6 @@ def _build_observability_blob(
         lines.append(
             f"- Step {event['step']} [{event['type']} | {event['status']}]: {event['reason']}"
         )
-        lines.append(f"  - Input: {event['input']}")
-        lines.append(f"  - Output: {event['output']}")
-        model_preview = event.get("model_preview")
-        if isinstance(model_preview, str) and model_preview:
-            lines.append(f"  - Model preview: {model_preview}")
-        row_preview = event.get("rows_preview")
-        if isinstance(row_preview, list) and row_preview:
-            lines.append("  - First rows (up to 10):")
-            for row in row_preview:
-                lines.append(f"    - {row}")
     return "```\n" + "\n".join(lines) + "\n```"
 
 
