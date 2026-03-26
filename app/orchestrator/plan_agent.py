@@ -758,27 +758,38 @@ def _resolve_record(
     if not _is_safe_symbol(field_name):
         return {"error": f"Invalid field API name `{field_name}`."}
     sf = get_salesforce_client(slack_user_id=requester_slack_user_id, workspace_id=workspace_id)
-    select_fields: list[str] = []
-    for candidate in ["Id", "Name", field_name]:
-        if candidate not in select_fields:
+    available_fields = _describe_field_names(sf=sf, object_name=object_name)
+    effective_field = _resolve_lookup_field_name(
+        object_name=object_name,
+        requested_field=field_name,
+        available_fields=available_fields,
+    )
+    display_field = _resolve_display_field_name(
+        object_name=object_name,
+        available_fields=available_fields,
+    )
+    select_fields: list[str] = ["Id"]
+    for candidate in [display_field, effective_field]:
+        if candidate and candidate not in select_fields:
             select_fields.append(candidate)
     soql = (
         f"SELECT {', '.join(select_fields)} FROM {object_name} "
-        f"WHERE {field_name} = '{_soql_escape(field_value)}' LIMIT 2"
+        f"WHERE {effective_field} = '{_soql_escape(field_value)}' LIMIT 2"
     )
     result = sf.query(soql)
     records = result.get("records", []) if isinstance(result, dict) else []
     ids = [str(item.get("Id", "")).strip() for item in records if isinstance(item, dict)]
     ids = [rid for rid in ids if rid]
     if not ids:
-        if field_name.lower() == "name":
+        if effective_field.lower() in {"name", "subject"}:
             return _resolve_record_name_suggestions(
                 sf=sf,
                 object_name=object_name,
                 field_value=field_value,
+                display_field=display_field or effective_field,
             )
         return {
-            "error": f"No {object_name} record found with {field_name}='{field_value}'.",
+            "error": f"No {object_name} record found with {effective_field}='{field_value}'.",
             "matches": [],
         }
     if len(ids) > 1:
@@ -787,7 +798,7 @@ def _resolve_record(
             "matches": [
                 {
                     "record_id": str(item.get("Id", "")).strip(),
-                    "name": str(item.get("Name", "")).strip(),
+                    "name": str(item.get(display_field, "")).strip(),
                 }
                 for item in records
                 if isinstance(item, dict) and str(item.get("Id", "")).strip()
@@ -796,7 +807,7 @@ def _resolve_record(
         }
     return {
         "object": object_name,
-        "field": field_name,
+        "field": effective_field,
         "value": field_value,
         "record_id": ids[0],
     }
@@ -806,8 +817,13 @@ def _resolve_record_name_suggestions(
     sf: Any,
     object_name: str,
     field_value: str,
+    display_field: str = "Name",
 ) -> dict[str, Any]:
-    records, truncated = _fetch_all_name_candidates(sf=sf, object_name=object_name)
+    records, truncated = _fetch_all_name_candidates(
+        sf=sf,
+        object_name=object_name,
+        display_field=display_field,
+    )
     if not records:
         return {
             "error": f"No {object_name} records with non-empty Name were found to compare against.",
@@ -821,7 +837,7 @@ def _resolve_record_name_suggestions(
         if not isinstance(item, dict):
             continue
         rid = str(item.get("Id", "")).strip()
-        name = str(item.get("Name", "")).strip()
+        name = str(item.get(display_field, "")).strip()
         if not rid or not name:
             continue
         score = difflib.SequenceMatcher(None, target, _normalize_name_for_match(name)).ratio()
@@ -852,13 +868,20 @@ def _resolve_record_name_suggestions(
     }
 
 
-def _fetch_all_name_candidates(sf: Any, object_name: str) -> tuple[list[dict[str, Any]], bool]:
+def _fetch_all_name_candidates(
+    sf: Any,
+    object_name: str,
+    display_field: str = "Name",
+) -> tuple[list[dict[str, Any]], bool]:
     """
     Fetch Name candidates without inventing query variants.
     Uses full pagination with a safety cap to avoid runaway scans.
     """
     safety_cap = 20000
-    soql = f"SELECT Id, Name FROM {object_name} WHERE Name != null ORDER BY Name"
+    soql = (
+        f"SELECT Id, {display_field} FROM {object_name} "
+        f"WHERE {display_field} != null ORDER BY {display_field}"
+    )
     result = sf.query(soql)
     records = result.get("records", []) if isinstance(result, dict) else []
     if not isinstance(records, list):
@@ -885,6 +908,51 @@ def _fetch_all_name_candidates(sf: Any, object_name: str) -> tuple[list[dict[str
     return records, truncated
 
 
+def _describe_field_names(sf: Any, object_name: str) -> set[str]:
+    try:
+        describe = sf.__getattr__(object_name).describe()
+    except Exception:
+        return set()
+    raw_fields = describe.get("fields", []) if isinstance(describe, dict) else []
+    names: set[str] = set()
+    if isinstance(raw_fields, list):
+        for item in raw_fields:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def _resolve_lookup_field_name(
+    object_name: str,
+    requested_field: str,
+    available_fields: set[str],
+) -> str:
+    if requested_field in available_fields:
+        return requested_field
+    if requested_field.lower() == "name":
+        for fallback in ("Name", "Subject", "CaseNumber"):
+            if fallback in available_fields:
+                return fallback
+    # Best effort fallback for Case title-like lookups.
+    if object_name.lower() == "case":
+        for fallback in ("Subject", "CaseNumber"):
+            if fallback in available_fields:
+                return fallback
+    return requested_field
+
+
+def _resolve_display_field_name(object_name: str, available_fields: set[str]) -> str:
+    if not available_fields:
+        return ""
+    for candidate in ("Name", "Subject", "CaseNumber"):
+        if candidate in available_fields:
+            return candidate
+    return ""
+
+
 def _normalize_name_for_match(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
@@ -892,7 +960,7 @@ def _normalize_name_for_match(value: str) -> str:
 def _next_action(client: Any, model: str, transcript: list[dict[str, str]]) -> dict[str, Any]:
     response = client.messages.create(
         model=model,
-        max_tokens=500,
+        max_tokens=900,
         temperature=0,
         system=PLAN_AGENT_PROMPT,
         messages=transcript,
@@ -944,7 +1012,7 @@ def _repair_action_json(client: Any, model: str, raw_text: str) -> dict[str, Any
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=350,
+            max_tokens=700,
             temperature=0,
             system=(
                 "Convert the input into ONE strict JSON object only.\n"

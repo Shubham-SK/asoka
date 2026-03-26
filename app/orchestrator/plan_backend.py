@@ -273,6 +273,13 @@ def _execute_one(sf: Any, op: dict[str, Any]) -> Any:
     if op_type == "sobject_create":
         return obj.create(fields)
     if op_type == "sobject_update":
+        record_ids = op.get("record_ids")
+        if isinstance(record_ids, list):
+            ids = [str(item).strip() for item in record_ids if str(item).strip()]
+            if not ids:
+                return {"success": True, "updated": 0}
+            results = [obj.update(record_id, fields) for record_id in ids]
+            return {"success": True, "updated": len(ids), "results": results}
         return obj.update(str(op["record_id"]).strip(), fields)
     if op_type == "sobject_upsert":
         external_id_path = f"{str(op['external_id_field']).strip()}/{str(op['external_id']).strip()}"
@@ -396,21 +403,33 @@ def _resolve_lookup_record_id(sf: Any, op: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(lookup, dict):
         return op
     object_name = str(op.get("object", "")).strip()
-    field_name = str(lookup.get("field", "Name")).strip() or "Name"
+    requested_field = str(lookup.get("field", "Name")).strip() or "Name"
     field_value = str(lookup.get("value", "")).strip()
     if not object_name or not field_value:
         return op
-
-    soql = (
-        f"SELECT Id, Name FROM {object_name} "
-        f"WHERE {field_name} = '{_soql_escape(field_value)}' LIMIT 2"
+    available_fields = _describe_field_names(sf=sf, object_name=object_name)
+    field_name = _resolve_lookup_field_name(
+        object_name=object_name,
+        requested_field=requested_field,
+        available_fields=available_fields,
     )
+
+    soql = f"SELECT Id FROM {object_name} WHERE {field_name} = '{_soql_escape(field_value)}' LIMIT 201"
     result = sf.query(soql)
     records = result.get("records", []) if isinstance(result, dict) else []
     if not isinstance(records, list):
         records = []
     ids = [str(item.get("Id", "")).strip() for item in records if isinstance(item, dict)]
     ids = [rid for rid in ids if rid]
+    op_type = str(op.get("op", "")).strip().lower()
+    if op_type == "sobject_update":
+        resolved = dict(op)
+        if len(ids) == 1:
+            resolved["record_id"] = ids[0]
+            return resolved
+        resolved["record_ids"] = ids
+        return resolved
+
     if len(ids) != 1:
         raise ValueError(
             f"Could not resolve unique `{object_name}` record for lookup {field_name}='{field_value}'."
@@ -663,4 +682,41 @@ def _extract_first_json_object_text(raw_text: str) -> str | None:
 
 def _soql_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _describe_field_names(sf: Any, object_name: str) -> set[str]:
+    try:
+        describe = sf.__getattr__(object_name).describe()
+    except Exception:
+        return set()
+    raw_fields = describe.get("fields", []) if isinstance(describe, dict) else []
+    names: set[str] = set()
+    if isinstance(raw_fields, list):
+        for item in raw_fields:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def _resolve_lookup_field_name(
+    object_name: str,
+    requested_field: str,
+    available_fields: set[str],
+) -> str:
+    if not available_fields:
+        return requested_field
+    if requested_field in available_fields:
+        return requested_field
+    if requested_field.lower() == "name":
+        for fallback in ("Name", "Subject", "CaseNumber"):
+            if fallback in available_fields:
+                return fallback
+    if object_name.lower() == "case":
+        for fallback in ("Subject", "CaseNumber"):
+            if fallback in available_fields:
+                return fallback
+    return requested_field
 
