@@ -8,6 +8,7 @@ from app.agent.mcp_service import run_mcp_read_agent
 from app.config import Settings
 from app.evidence.ingestion import ingest_read_response_into_kb
 from app.orchestrator.classifier import classify_message
+from app.orchestrator.knowledge_agent import run_knowledge_agent
 from app.orchestrator.plan_agent import run_plan_agent
 from app.salesforce.oauth import build_oauth_start_url, has_user_oauth_identity
 
@@ -49,6 +50,16 @@ class Orchestrator:
                 parsed_intent=classification.intent,
                 parsed_intent_reason=classification.reason,
                 progress_callback=progress_callback,
+            )
+        if classification.intent == "knowledge_management":
+            return self._handle_knowledge_management(
+                is_coworker=is_coworker,
+                user_id=user_id,
+                workspace_id=workspace_id or "default",
+                text=text,
+                conversation_window=conversation_window,
+                parsed_intent=classification.intent,
+                parsed_intent_reason=classification.reason,
             )
 
         if classification.intent in {
@@ -202,3 +213,25 @@ class Orchestrator:
             progress_callback=progress_callback,
         )
         return result.message
+
+    def _handle_knowledge_management(
+        self,
+        is_coworker: bool,
+        user_id: str,
+        workspace_id: str,
+        text: str,
+        conversation_window: str,
+        parsed_intent: str,
+        parsed_intent_reason: str,
+    ) -> str:
+        if not is_coworker:
+            return "Only the designated human coworker can manage knowledge instances."
+        return run_knowledge_agent(
+            settings=self.settings,
+            user_text=text,
+            workspace_id=workspace_id,
+            requester_slack_user_id=user_id,
+            parsed_intent=parsed_intent,
+            parsed_intent_reason=parsed_intent_reason,
+            conversation_window=conversation_window,
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,7 +12,7 @@ CLASSIFIER_PROMPT = """
 You classify Slack DM requests for a Salesforce assistant.
 
 Return ONLY valid JSON:
-{"intent":"read_request|write_request|context_edit|approval_response|role_scope_query|plan_management|knowledge_ingestion","reason":"short reason"}
+{"intent":"read_request|write_request|context_edit|approval_response|role_scope_query|plan_management|knowledge_ingestion|knowledge_management","reason":"short reason"}
 
 Definitions:
 - read_request: asks for information; read-only Salesforce operations.
@@ -21,10 +22,11 @@ Definitions:
 - role_scope_query: asks about user role, permissions, or what actions they are allowed to perform.
 - plan_management: asks to list/show/check/open pending plans or plan queue state.
 - knowledge_ingestion: coworker explicitly asks to ingest/update structured knowledge from recent outputs/context.
+- knowledge_management: coworker asks to query/create/update/delete knowledge instances in the knowledge base.
 
 Rules:
 - Use best judgment from semantics, not keyword matching.
-- context_edit, approval_response, and knowledge_ingestion are only valid when is_coworker=true; otherwise choose read_request or write_request.
+- context_edit, approval_response, knowledge_ingestion, and knowledge_management are only valid when is_coworker=true; otherwise choose read_request or write_request.
 - Keep reason concise.
 """
 
@@ -41,6 +43,10 @@ def classify_message(
     settings: Settings,
     conversation_window: str = "",
 ) -> ClassificationResult:
+    rule_based = _rule_based_knowledge_intent(text=text, is_coworker=is_coworker)
+    if rule_based is not None:
+        return rule_based
+
     if not settings.llm_enabled or settings.llm_provider != "anthropic":
         return ClassificationResult(
             intent="read_request",
@@ -85,6 +91,7 @@ def classify_message(
         "role_scope_query",
         "plan_management",
         "knowledge_ingestion",
+        "knowledge_management",
     }
     if intent not in allowed_intents:
         intent = "read_request"
@@ -98,6 +105,9 @@ def classify_message(
     if intent == "knowledge_ingestion" and not is_coworker:
         intent = "read_request"
         reason = "knowledge_ingestion rejected for non-coworker"
+    if intent == "knowledge_management" and not is_coworker:
+        intent = "read_request"
+        reason = "knowledge_management rejected for non-coworker"
     return ClassificationResult(intent=intent, reason=reason)
 
 
@@ -115,3 +125,38 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
         raw_text = raw_text.strip("`")
         raw_text = raw_text.replace("json", "", 1).strip()
     return json.loads(raw_text)
+
+
+def _rule_based_knowledge_intent(text: str, is_coworker: bool) -> ClassificationResult | None:
+    if not is_coworker:
+        return None
+    normalized = " ".join(text.lower().split())
+    if not normalized:
+        return None
+
+    # Explicit ingestion requests only.
+    ingestion_patterns = [
+        r"\b(re[- ]?ingest|ingest|run ingestion|start ingestion)\b",
+        r"\b(extract|harvest|populate|persist)\b.{0,40}\bknowledge\b",
+        r"\brebuild\b.{0,40}\bknowledge\b",
+    ]
+    if any(re.search(pattern, normalized) for pattern in ingestion_patterns):
+        return ClassificationResult(
+            intent="knowledge_ingestion",
+            reason="rule_based: explicit ingestion request",
+        )
+
+    # Knowledge-instance query/CRUD requests.
+    management_patterns = [
+        r"\bwhat (?:have you|did you) learn",
+        r"\bwhat do you know\b",
+        r"\btesting philosophy\b",
+        r"\bknowledge (?:items|instances|base)\b",
+        r"\b(list|show|query|search|find|create|add|update|edit|delete|remove)\b.{0,30}\bknowledge\b",
+    ]
+    if any(re.search(pattern, normalized) for pattern in management_patterns):
+        return ClassificationResult(
+            intent="knowledge_management",
+            reason="rule_based: knowledge query or CRUD request",
+        )
+    return None

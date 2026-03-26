@@ -518,6 +518,107 @@ def list_open_policy_questions(
     return list(db.scalars(stmt).all())
 
 
+def list_knowledge_items(
+    db: Session,
+    workspace_id: str,
+    limit: int = 25,
+    include_superseded: bool = False,
+    kinds: list[KnowledgeKind] | None = None,
+    query: str | None = None,
+) -> list[KnowledgeItem]:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        return []
+    stmt = select(KnowledgeItem).where(KnowledgeItem.workspace_id == workspace.id)
+    if not include_superseded:
+        stmt = stmt.where(KnowledgeItem.lifecycle_status == KnowledgeLifecycleStatus.active)
+    if kinds:
+        stmt = stmt.where(KnowledgeItem.kind.in_(kinds))
+    stmt = stmt.order_by(KnowledgeItem.updated_at.desc()).limit(max(1, min(limit, 200)))
+    items = list(db.scalars(stmt).all())
+    text_query = (query or "").strip().lower()
+    if not text_query:
+        return items
+    filtered: list[KnowledgeItem] = []
+    for item in items:
+        statement = str((item.content_json or {}).get("statement", "")).lower()
+        if text_query in item.title.lower() or text_query in statement:
+            filtered.append(item)
+    return filtered
+
+
+def get_knowledge_item_by_id(
+    db: Session,
+    workspace_id: str,
+    knowledge_id: str,
+) -> KnowledgeItem | None:
+    workspace = db.scalar(select(Workspace).where(Workspace.slack_team_id == workspace_id))
+    if workspace is None:
+        return None
+    return db.scalar(
+        select(KnowledgeItem).where(
+            KnowledgeItem.workspace_id == workspace.id,
+            KnowledgeItem.id == knowledge_id,
+        )
+    )
+
+
+def update_knowledge_item(
+    db: Session,
+    workspace_id: str,
+    knowledge_id: str,
+    *,
+    title: str | None = None,
+    statement: str | None = None,
+    kind: KnowledgeKind | None = None,
+    confidence_tier: ConfidenceTier | None = None,
+    confidence_score: float | None = None,
+    sf_object_api_name: str | None = None,
+    sf_field_api_name: str | None = None,
+    question_status: KnowledgeQuestionStatus | None = None,
+    lifecycle_status: KnowledgeLifecycleStatus | None = None,
+) -> KnowledgeItem | None:
+    item = get_knowledge_item_by_id(db=db, workspace_id=workspace_id, knowledge_id=knowledge_id)
+    if item is None:
+        return None
+    if title is not None:
+        item.title = title.strip()[:500] or item.title
+    if statement is not None:
+        content = dict(item.content_json or {})
+        content["statement"] = statement.strip()
+        item.content_json = content
+    if kind is not None:
+        item.kind = kind
+    if confidence_tier is not None:
+        item.confidence_tier = confidence_tier
+        item.confidence_rank = _confidence_rank(confidence_tier)
+    if confidence_score is not None:
+        item.confidence_score = max(0.0, min(float(confidence_score), 1.0))
+    if sf_object_api_name is not None:
+        item.sf_object_api_name = sf_object_api_name.strip() or None
+    if sf_field_api_name is not None:
+        item.sf_field_api_name = sf_field_api_name.strip() or None
+    if question_status is not None:
+        item.question_status = question_status
+    if lifecycle_status is not None:
+        item.lifecycle_status = lifecycle_status
+    db.flush()
+    return item
+
+
+def delete_knowledge_item(
+    db: Session,
+    workspace_id: str,
+    knowledge_id: str,
+) -> bool:
+    item = get_knowledge_item_by_id(db=db, workspace_id=workspace_id, knowledge_id=knowledge_id)
+    if item is None:
+        return False
+    item.lifecycle_status = KnowledgeLifecycleStatus.superseded
+    db.flush()
+    return True
+
+
 def resolve_or_supersede_by_canonical_key(
     db: Session,
     workspace_id: str,

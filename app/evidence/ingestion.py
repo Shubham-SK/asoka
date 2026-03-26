@@ -70,7 +70,7 @@ Rules:
 - Hard limits:
   - facts: at most 12
   - hypotheses: at most 6
-  - questions: exactly 1
+  - questions: exactly 3
 - Priority order for fact extraction (highest first):
   1) Examine validation rules and hard constraints found in salesforce. Establish facts for each.
   2) Examine feature behavior and object/field descriptions.
@@ -424,7 +424,7 @@ def _run_knowledge_discovery(
     )
 
     # 2) Feature behavior and object/field descriptions
-    for obj in ["Opportunity", "Account", "Lead"]:
+    for obj in ["Opportunity", "Account", "Lead", "Case"]:
         chunks[f"describe_{obj.lower()}"] = (
             _call_discovery_tool(
                 events=events,
