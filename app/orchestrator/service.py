@@ -38,8 +38,6 @@ class Orchestrator:
         )
         logger.info("intent=%s reason=%s", classification.intent, classification.reason)
 
-        if classification.intent == "context_edit":
-            return self._handle_context_edit(is_coworker=is_coworker, text=text)
         if classification.intent == "knowledge_ingestion":
             return self._handle_manual_knowledge_ingestion(
                 is_coworker=is_coworker,
@@ -91,16 +89,6 @@ class Orchestrator:
             conversation_window=conversation_window,
             progress_callback=progress_callback,
         )
-
-    def _handle_context_edit(self, is_coworker: bool, text: str) -> str:
-        if not is_coworker:
-            return "Only the designated human coworker can edit context."
-
-        return (
-            "Context update path is wired for Phase 4. I captured your message intent and "
-            f"will persist + summarize updates once the context store is added.\n\nInput: {text}"
-        )
-
 
     def _handle_read_request(
         self,

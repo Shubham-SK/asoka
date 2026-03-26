@@ -23,7 +23,9 @@ Rules:
 - Read-only only. Never perform write/mutating operations.
 - Prefer discovery first: inspect available tools before calling unfamiliar ones.
 - If an MCP tool fails, inspect the error and try a corrected read-only call.
-- Keep final answer concise for Slack mrkdwn (no markdown tables).
+- Keep final answer concise for Slack mrkdwn.
+- Do not use markdown tables, headings (`#`), markdown links `[text](url)`, or `**bold**`.
+- For emphasis, use Slack mrkdwn (`*bold*`), and for links use Slack format (`<https://example.com|label>`).
 """
 
 

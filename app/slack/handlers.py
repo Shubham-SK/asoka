@@ -412,11 +412,13 @@ def _notify_coworker_pending_plan(
     if not settings.slack_coworker_user_id:
         return
 
+    plan_snapshot = _render_plan_snapshot(workspace_id=workspace_id, plan_id=plan_id)
     msg = (
         "New write plan pending approval.\n"
         f"- Workspace: `{workspace_id}`\n"
         f"- Requester: <@{requester_slack_user_id}>\n"
         f"- Plan ID: `{plan_id}`\n"
+        f"{plan_snapshot}\n"
         "You can approve via button, or reply with `approve/reject plan <plan_id> ...`."
     )
     blocks = [
@@ -424,12 +426,16 @@ def _notify_coworker_pending_plan(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
+                "text": _truncate_for_slack(
+                    (
                     "*New write plan pending approval*\n"
                     f"Workspace: `{workspace_id}`\n"
                     f"Requester: <@{requester_slack_user_id}>\n"
                     f"Plan ID: `{plan_id}`\n"
-                    f"Summary: {summary}"
+                    f"Summary: {summary}\n"
+                    f"{plan_snapshot}"
+                    ),
+                    max_chars=2800,
                 ),
             },
         },

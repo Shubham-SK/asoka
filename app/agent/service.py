@@ -43,6 +43,8 @@ Rules:
 - If a query result is enough, return action=final with concise answer.
 - For action=final, format answer for Slack mrkdwn, not GitHub markdown.
 - Do not use markdown tables; use bullet lists or fenced code blocks instead.
+- Do not use GitHub/CommonMark constructs like headings (`#`), markdown links `[text](url)`, or `**bold**`.
+- For emphasis, use Slack mrkdwn (`*bold*`), and for links use Slack format (`<https://example.com|label>`).
 - Keep final answers brief and scannable for DM.
 - If a tool call fails, inspect the error and try a corrected query/action.
 - Use tooling_query when you need metadata/config entities such as ValidationRule.
@@ -61,6 +63,8 @@ Use the prior transcript and tool outputs.
 
 Requirements:
 - Output plain Slack mrkdwn text only (no JSON).
+- Do not use GitHub/CommonMark constructs like headings (`#`), markdown links `[text](url)`, or `**bold**`.
+- For emphasis, use Slack mrkdwn (`*bold*`), and for links use Slack format (`<https://example.com|label>`).
 - Summarize what is known with high confidence.
 - Clearly call out uncertainties and failed tool attempts.
 - Keep concise and actionable.

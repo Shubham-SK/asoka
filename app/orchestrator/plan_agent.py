@@ -44,9 +44,11 @@ Rules:
 - For non-coworkers, never approve/reject plans; explain limitation in final answer.
 - For non-coworkers, only query plans for requester=self.
 - Keep final answers concise for Slack mrkdwn.
-- Do not use markdown tables; use bullet lists or short paragraphs.
-- After create_plan, include exact token `Plan ID: \`<uuid>\`` in final answer.
-- If create_plan result status is pending_approval, include exact token `Status: \`pending_approval\``.
+- Do not use markdown tables, headings (`#`), markdown links `[text](url)`, or `**bold**`.
+- Use Slack mrkdwn style (`*bold*`) and Slack link format (`<https://example.com|label>`).
+- Prefer bullet lists or short paragraphs.
+- After create_plan, include exact token: Plan ID: `<uuid>` in final answer.
+- If create_plan result status is pending_approval, include exact token: Status: `pending_approval`.
 - After create_plan, include a short "Plan" section in the final answer with summary and operations.
 - If approve/reject tools return `needs_clarification=true`, ask the user to pick one plan ID explicitly.
 - For status questions like "denied?", "approved?", or "all plans", use `list_plans` (not `list_pending_plans`).
@@ -168,6 +170,21 @@ def run_plan_agent(
             )
             events[-1]["status"] = "success"
             events[-1]["output"] = _truncate_text(json.dumps(result, ensure_ascii=True), 220)
+            if tool == "create_plan" and isinstance(result, dict):
+                knowledge_precheck = result.get("knowledge_precheck")
+                if isinstance(knowledge_precheck, dict):
+                    events.append(
+                        {
+                            "step": str(len(events) + 1),
+                            "type": "knowledge_precheck",
+                            "status": "success",
+                            "reason": "Consulted knowledge base for write-path policy checks.",
+                            "input": "knowledge_precheck(create_plan operations)",
+                            "output": _truncate_text(
+                                json.dumps(knowledge_precheck, ensure_ascii=True), 300
+                            ),
+                        }
+                    )
             _emit_progress_update(
                 progress_callback=progress_callback,
                 events=events,
@@ -350,6 +367,53 @@ def _run_tool(
             assumptions.append({"type": "intent_reason", "value": parsed_intent_reason})
 
         with SessionLocal() as db:
+            precheck = _knowledge_precheck_create_plan(
+                db=db,
+                workspace_id=workspace_id,
+                operations=operations,
+                user_text=user_text,
+            )
+            missing_requirements = precheck.get("missing_requirements", [])
+            warnings = precheck.get("warnings", [])
+            clarification_questions = precheck.get("clarification_questions", [])
+            if missing_requirements:
+                assumptions.append(
+                    {
+                        "type": "knowledge_missing_requirements",
+                        "value": missing_requirements[:10],
+                    }
+                )
+            if warnings:
+                assumptions.append(
+                    {
+                        "type": "knowledge_warnings",
+                        "value": warnings[:10],
+                    }
+                )
+            if clarification_questions:
+                assumptions.append(
+                    {
+                        "type": "knowledge_clarification_questions",
+                        "value": clarification_questions[:5],
+                    }
+                )
+
+            safety_checks: list[dict[str, Any]] = []
+            if missing_requirements:
+                safety_checks.append(
+                    {
+                        "kind": "knowledge_missing_requirements",
+                        "count": len(missing_requirements),
+                    }
+                )
+            if warnings:
+                safety_checks.append(
+                    {
+                        "kind": "knowledge_policy_warnings",
+                        "count": len(warnings),
+                    }
+                )
+
             # All write plans require explicit review/approval, including coworker-created plans.
             status = PlanStatus.pending_approval
             plan = create_execution_plan(
@@ -359,7 +423,7 @@ def _run_tool(
                 summary=summary,
                 operations=operations,
                 assumptions=assumptions,
-                safety_checks=[],
+                safety_checks=safety_checks,
                 status=status,
             )
             plan_id = plan.id
@@ -381,6 +445,12 @@ def _run_tool(
         return {
             "plan_id": plan_id,
             "status": status.value,
+            "needs_clarification": bool(missing_requirements),
+            "knowledge_precheck": {
+                "missing_requirements": missing_requirements,
+                "warnings": warnings,
+                "clarification_questions": clarification_questions,
+            },
             "plan": {
                 "summary": summary,
                 "operations": operations,
@@ -1120,6 +1190,12 @@ def _build_observability_blob(
         lines.append(
             f"- Step {event['step']} [{event['type']} | {event['status']}]: {event['reason']}"
         )
+        event_input = str(event.get("input", "")).strip()
+        event_output = str(event.get("output", "")).strip()
+        if event_input:
+            lines.append(f"  - Input: {event_input}")
+        if event_output:
+            lines.append(f"  - Output: {event_output}")
     return "```\n" + "\n".join(lines) + "\n```"
 
 
@@ -1202,7 +1278,13 @@ def _knowledge_precheck_create_plan(
     knowledge_items = list_knowledge_for_retrieval(
         db=db,
         workspace_id=workspace_id,
-        kinds=[KnowledgeKind.rule, KnowledgeKind.fact, KnowledgeKind.question],
+        kinds=[
+            KnowledgeKind.rule,
+            KnowledgeKind.fact,
+            KnowledgeKind.question,
+            KnowledgeKind.hypothesis,
+            KnowledgeKind.trend,
+        ],
         min_confidence_rank=1,
         limit=120,
     )
@@ -1213,6 +1295,8 @@ def _knowledge_precheck_create_plan(
     )
     required_fields = _infer_required_fields_from_knowledge(knowledge_items)
     tier_minimums, global_minimum = _infer_amount_thresholds_from_knowledge(knowledge_items)
+    delete_restrictions = _infer_delete_restrictions_from_knowledge(knowledge_items)
+    name_casing_policies = _infer_name_casing_policies_from_knowledge(knowledge_items)
     text_lower = user_text.lower()
     inferred_tier = _infer_tier_from_text(text_lower)
     missing_requirements: list[dict[str, Any]] = []
@@ -1259,6 +1343,51 @@ def _knowledge_precheck_create_plan(
                     }
                 )
 
+        if op_type in {"sobject_create", "sobject_update"}:
+            name_value = fields.get("Name")
+            if isinstance(name_value, str) and name_value.strip():
+                policy = name_casing_policies.get(object_name.lower()) or name_casing_policies.get("*")
+                if policy == "forbid_all_lowercase" and _looks_all_lowercase_name(name_value):
+                    warnings.append(
+                        {
+                            "operation": op_type,
+                            "object": object_name,
+                            "field": "Name",
+                            "provided": name_value,
+                            "message": (
+                                "This name appears all-lowercase and may violate known naming policy. "
+                                "Please confirm before proceeding."
+                            ),
+                        }
+                    )
+                if policy == "require_title_case" and not _looks_title_case_name(name_value):
+                    warnings.append(
+                        {
+                            "operation": op_type,
+                            "object": object_name,
+                            "field": "Name",
+                            "provided": name_value,
+                            "message": (
+                                "This name may violate known naming policy requiring Title Case. "
+                                "Please confirm before proceeding."
+                            ),
+                        }
+                    )
+
+        if op_type == "sobject_delete":
+            restricted_reason = delete_restrictions.get(object_name.lower())
+            if restricted_reason:
+                warnings.append(
+                    {
+                        "operation": op_type,
+                        "object": object_name,
+                        "message": (
+                            f"Deletion may violate known policy: {restricted_reason}. "
+                            "Please confirm this delete should proceed."
+                        ),
+                    }
+                )
+
     clarification_questions: list[str] = []
     for item in knowledge_items:
         if item.kind != KnowledgeKind.question:
@@ -1269,6 +1398,14 @@ def _knowledge_precheck_create_plan(
         if len(clarification_questions) >= 3:
             break
     return {
+        "consulted_items": len(knowledge_items),
+        "consulted_kind_counts": {
+            "rule": sum(1 for item in knowledge_items if item.kind == KnowledgeKind.rule),
+            "fact": sum(1 for item in knowledge_items if item.kind == KnowledgeKind.fact),
+            "question": sum(1 for item in knowledge_items if item.kind == KnowledgeKind.question),
+            "hypothesis": sum(1 for item in knowledge_items if item.kind == KnowledgeKind.hypothesis),
+            "trend": sum(1 for item in knowledge_items if item.kind == KnowledgeKind.trend),
+        },
         "missing_requirements": missing_requirements,
         "warnings": warnings,
         "clarification_questions": clarification_questions,
@@ -1322,6 +1459,101 @@ def _infer_amount_thresholds_from_knowledge(
             if global_minimum is None or amount > global_minimum:
                 global_minimum = amount
     return by_tier, global_minimum
+
+
+def _infer_delete_restrictions_from_knowledge(knowledge_items: list[Any]) -> dict[str, str]:
+    """
+    Infer object-level delete restrictions from rule/fact statements.
+    Heuristic by design: this provides warnings, not hard blockers.
+    """
+    out: dict[str, str] = {}
+    for item in knowledge_items:
+        if item.kind not in {KnowledgeKind.rule, KnowledgeKind.fact}:
+            continue
+        title = str(item.title or "").strip()
+        statement = str((item.content_json or {}).get("statement", "")).strip()
+        text = f"{title} {statement}".strip()
+        lowered = text.lower()
+        if not lowered:
+            continue
+        if not any(phrase in lowered for phrase in ["do not delete", "cannot delete", "must not delete", "never delete"]):
+            continue
+        object_name = _infer_object_name(text)
+        if not object_name:
+            continue
+        out[object_name.lower()] = statement or title or "delete restriction noted in knowledge base"
+    return out
+
+
+def _infer_name_casing_policies_from_knowledge(knowledge_items: list[Any]) -> dict[str, str]:
+    """
+    Infer coarse naming policies (currently focused on lowercase prohibitions).
+    Returns object-keyed policy map, with '*' as global fallback.
+    """
+    out: dict[str, str] = {}
+    for item in knowledge_items:
+        if item.kind not in {KnowledgeKind.rule, KnowledgeKind.fact}:
+            continue
+        title = str(item.title or "").strip()
+        statement = str((item.content_json or {}).get("statement", "")).strip()
+        text = f"{title} {statement}".strip()
+        lowered = text.lower()
+        if not lowered:
+            continue
+        object_name = _infer_object_name(text)
+        key = object_name.lower() if object_name else "*"
+        forbids_lowercase = "lowercase" in lowered and any(
+            phrase in lowered
+            for phrase in [
+                "do not",
+                "don't",
+                "dont",
+                "cannot",
+                "must not",
+                "never",
+                "avoid",
+            ]
+        )
+        requires_title_case = "title case" in lowered and any(
+            phrase in lowered
+            for phrase in [
+                "must",
+                "always",
+                "required",
+                "require",
+                "should",
+            ]
+        )
+        if forbids_lowercase:
+            out[key] = "forbid_all_lowercase"
+        elif requires_title_case:
+            out[key] = "require_title_case"
+    return out
+
+
+def _looks_all_lowercase_name(value: str) -> bool:
+    letters = [ch for ch in value if ch.isalpha()]
+    if not letters:
+        return False
+    return "".join(letters).islower()
+
+
+def _looks_title_case_name(value: str) -> bool:
+    words = [part.strip(".,;:!?()[]{}\"'") for part in value.split()]
+    words = [part for part in words if part]
+    if not words:
+        return False
+    for word in words:
+        letters = [ch for ch in word if ch.isalpha()]
+        if not letters:
+            continue
+        joined = "".join(letters)
+        if joined.isupper():
+            continue
+        first_alpha = next((ch for ch in word if ch.isalpha()), "")
+        if not first_alpha or not first_alpha.isupper():
+            return False
+    return True
 
 
 def _parse_numeric(value: Any) -> float | None:

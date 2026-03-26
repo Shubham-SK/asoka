@@ -38,7 +38,9 @@ Rules:
 - Never output non-JSON text.
 - For create, include at least title + statement and sensible defaults.
 - For update/delete, fetch the target first if ID context is unclear.
-- Keep final answers concise for Slack.
+- Keep final answers concise for Slack mrkdwn.
+- Do not use markdown tables, headings (`#`), markdown links `[text](url)`, or `**bold**`.
+- Use Slack mrkdwn style (`*bold*`) and Slack link format (`<https://example.com|label>`).
 """
 
 

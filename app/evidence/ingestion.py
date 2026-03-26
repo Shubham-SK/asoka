@@ -70,7 +70,7 @@ Rules:
 - Hard limits:
   - facts: at most 12
   - hypotheses: at most 6
-  - questions: exactly 3
+  - questions: 5
 - Priority order for fact extraction (highest first):
   1) Examine validation rules and hard constraints found in salesforce. Establish facts for each.
   2) Examine feature behavior and object/field descriptions.
@@ -83,6 +83,16 @@ Rules:
 - Known policy (fixed): only the designated human co-worker can approve/auto-approve tasks; end-users cannot.
 - Do not generate facts, hypotheses, or questions that challenge or re-investigate this approval policy.
 - Prioritize asking questions that target policy, constraints, required inputs, and edge-case behavior.
+- If you observe similar or overlapping fields/columns (for example same object, similar names, or similar labels), ask about qualitative differences:
+  - when each field should be used
+  - business meaning distinctions
+  - boundary conditions and conflict resolution when both might apply
+- Prefer these qualitative-difference questions over generic process questions when both are possible.
+- Explicitly prioritize custom Salesforce items in questions:
+  - custom objects (`__c`)
+  - custom fields (`__c`)
+  - custom automation or integration-specific fields
+  - ask what business process each custom item supports and who owns its definition
 - Generate exactly 1 high-quality question from the highest-value hypothesis/uncertainty gap.
 - If validation-rule details are present in discovery context, convert them into concrete `kind="rule"` facts.
 - Do not ask questions that simply request the content of validation rules already provided in context.
@@ -424,7 +434,7 @@ def _run_knowledge_discovery(
     )
 
     # 2) Feature behavior and object/field descriptions
-    for obj in ["Opportunity", "Account", "Lead", "Case"]:
+    for obj in ["User", "Opportunity", "Account", "Lead", "Case"]:
         chunks[f"describe_{obj.lower()}"] = (
             _call_discovery_tool(
                 events=events,
@@ -781,6 +791,10 @@ Rules:
 - Keep confidence_score between 0 and 1.
 - If validation-rule details exist, convert them to kind=rule facts.
 - If rule details are present, do not ask questions requesting those same rule details.
+- If similar or overlapping fields are present, prioritize one question on qualitative differences
+  (when to use each field, business intent, and edge-case boundaries).
+- If custom items are present, make the question explicitly about custom items first
+  (custom objects/fields, their intended usage, ownership, and constraints).
 """
 
 
