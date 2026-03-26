@@ -4,11 +4,23 @@ import json
 import logging
 from typing import Any
 
-from app.agent.tools import sf_describe_object, sf_query_read_only, sf_tooling_query
+from app.agent.tools import (
+    artifact_extract_path,
+    artifact_get_tree,
+    artifact_list_keys,
+    artifact_search_text,
+    artifact_store,
+    sf_describe_object,
+    sf_query_read_only,
+    sf_tooling_query,
+)
 from app.config import Settings
 from app.llm.client import get_claude_client
 
 logger = logging.getLogger(__name__)
+
+ARTIFACT_MIN_BYTES = 6000
+ARTIFACT_MIN_RECORDS = 20
 
 SYSTEM_PROMPT = """
 You are a Salesforce read-only assistant.
@@ -18,6 +30,10 @@ At each step, return ONLY valid JSON with one of these shapes:
 {"action":"query","soql":"SELECT ...","reason":"..."}
 {"action":"tooling_query","soql":"SELECT ...","reason":"..."}
 {"action":"describe","object":"Account","reason":"..."}
+{"action":"artifact_list_keys","artifact_id":"art_xxx","path":"fields","reason":"..."}
+{"action":"artifact_get_tree","artifact_id":"art_xxx","path":"fields[0]","max_depth":2,"reason":"..."}
+{"action":"artifact_search_text","artifact_id":"art_xxx","query":"Type","max_hits":20,"reason":"..."}
+{"action":"artifact_extract_path","artifact_id":"art_xxx","path":"fields[0].name","max_chars":4000,"reason":"..."}
 {"action":"final","answer":"..."}
 
 Rules:
@@ -30,6 +46,12 @@ Rules:
 - Keep final answers brief and scannable for DM.
 - If a tool call fails, inspect the error and try a corrected query/action.
 - Use tooling_query when you need metadata/config entities such as ValidationRule.
+- Large JSON outputs should be explored via artifact_* tools instead of asking for full dumps.
+- After query/describe/tooling_query success, use returned artifact_id for follow-up extraction.
+- Do not guess object names, field names, stage names, picklist values, record types, asset names, or other identifiers.
+- When any requested name is uncertain, do discovery first by listing/describing metadata and then use the exact discovered names.
+- Prefer discovery-first plans: identify valid objects/fields/values before constructing filtered queries.
+- If user phrasing is ambiguous, resolve it by discovery queries rather than assumptions.
 """
 
 FORCED_FINAL_PROMPT = """
@@ -52,7 +74,7 @@ def run_read_agent(
 ) -> str:
     client = get_claude_client()
     attempts: list[str] = []
-    events: list[dict[str, str]] = []
+    events: list[dict[str, Any]] = []
     context_block = (
         "Recent DM conversation window (oldest to newest):\n"
         f"{_truncate_text(conversation_window, 12000) if conversation_window else '<none>'}\n\n"
@@ -143,15 +165,17 @@ def run_read_agent(
             try:
                 result = sf_describe_object(object_name)
                 summary = _summarize_describe_result(result)
+                materialized = _materialize_result_for_model(
+                    result=result,
+                    source=f"describe:{object_name}",
+                    include_rows_preview=False,
+                )
                 attempts.append(f"  -> success: {summary}")
                 events[-1]["status"] = "success"
-                events[-1]["output"] = summary
-                transcript.append(
-                    {
-                        "role": "user",
-                        "content": f"Tool result (describe {object_name}):\n{_truncate_json(result)}",
-                    }
-                )
+                events[-1]["output"] = _materialized_output_summary(summary, materialized)
+                tool_content = f"Tool result (describe {object_name}):\n{materialized['model_payload']}"
+                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
+                transcript.append({"role": "user", "content": tool_content})
             except Exception as exc:
                 logger.info("Describe tool failed, allowing model retry: %s", exc)
                 attempts.append(f"  -> error: {type(exc).__name__}")
@@ -198,15 +222,18 @@ def run_read_agent(
             try:
                 result = sf_query_read_only(soql)
                 summary = _summarize_query_result(result)
+                materialized = _materialize_result_for_model(
+                    result=result,
+                    source="query",
+                    include_rows_preview=True,
+                )
                 attempts.append(f"  -> success: {summary}")
                 events[-1]["status"] = "success"
-                events[-1]["output"] = summary
-                transcript.append(
-                    {
-                        "role": "user",
-                        "content": f"Tool result (query):\n{_truncate_json(result)}",
-                    }
-                )
+                events[-1]["output"] = _materialized_output_summary(summary, materialized)
+                events[-1]["rows_preview"] = materialized.get("rows_preview", [])
+                tool_content = f"Tool result (query):\n{materialized['model_payload']}"
+                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
+                transcript.append({"role": "user", "content": tool_content})
             except Exception as exc:
                 logger.info("Query tool failed, allowing model retry: %s", exc)
                 attempts.append(f"  -> error: {type(exc).__name__}")
@@ -255,15 +282,18 @@ def run_read_agent(
             try:
                 result = sf_tooling_query(soql)
                 summary = _summarize_query_result(result)
+                materialized = _materialize_result_for_model(
+                    result=result,
+                    source="tooling_query",
+                    include_rows_preview=True,
+                )
                 attempts.append(f"  -> success: {summary}")
                 events[-1]["status"] = "success"
-                events[-1]["output"] = summary
-                transcript.append(
-                    {
-                        "role": "user",
-                        "content": f"Tool result (tooling_query):\n{_truncate_json(result)}",
-                    }
-                )
+                events[-1]["output"] = _materialized_output_summary(summary, materialized)
+                events[-1]["rows_preview"] = materialized.get("rows_preview", [])
+                tool_content = f"Tool result (tooling_query):\n{materialized['model_payload']}"
+                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
+                transcript.append({"role": "user", "content": tool_content})
             except Exception as exc:
                 logger.info("Tooling query failed, allowing model retry: %s", exc)
                 attempts.append(f"  -> error: {type(exc).__name__}")
@@ -273,6 +303,153 @@ def run_read_agent(
                     {
                         "role": "user",
                         "content": f"Tool error (tooling_query): {type(exc).__name__}: {exc}",
+                    }
+                )
+            continue
+
+        if action_type == "artifact_list_keys":
+            artifact_id = str(action.get("artifact_id", "")).strip()
+            path = str(action.get("path", "")).strip()
+            attempts.append(
+                f"step {step + 1}: artifact_list_keys artifact_id={artifact_id or '<missing>'} path={path or '<root>'}"
+            )
+            events.append(
+                {
+                    "step": str(step + 1),
+                    "type": "artifact_list_keys",
+                    "reason": action_reason or "no reason provided",
+                    "input": f"artifact_id={artifact_id}, path={path or '<root>'}",
+                    "status": "started",
+                    "output": "",
+                }
+            )
+            transcript.append({"role": "assistant", "content": json.dumps(action)})
+            try:
+                result = artifact_list_keys(artifact_id=artifact_id, path=path)
+                events[-1]["status"] = "success"
+                events[-1]["output"] = _truncate_text(json.dumps(result, ensure_ascii=True), 220)
+                tool_content = f"Tool result (artifact_list_keys):\n{json.dumps(result, ensure_ascii=True)}"
+                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
+                transcript.append({"role": "user", "content": tool_content})
+            except Exception as exc:
+                events[-1]["status"] = "error"
+                events[-1]["output"] = _truncate_text(f"{type(exc).__name__}: {exc}", 220)
+                transcript.append(
+                    {
+                        "role": "user",
+                        "content": f"Tool error (artifact_list_keys): {type(exc).__name__}: {exc}",
+                    }
+                )
+            continue
+
+        if action_type == "artifact_get_tree":
+            artifact_id = str(action.get("artifact_id", "")).strip()
+            path = str(action.get("path", "")).strip()
+            max_depth = int(action.get("max_depth", 2) or 2)
+            attempts.append(
+                f"step {step + 1}: artifact_get_tree artifact_id={artifact_id or '<missing>'} path={path or '<root>'}"
+            )
+            events.append(
+                {
+                    "step": str(step + 1),
+                    "type": "artifact_get_tree",
+                    "reason": action_reason or "no reason provided",
+                    "input": f"artifact_id={artifact_id}, path={path or '<root>'}, max_depth={max_depth}",
+                    "status": "started",
+                    "output": "",
+                }
+            )
+            transcript.append({"role": "assistant", "content": json.dumps(action)})
+            try:
+                result = artifact_get_tree(artifact_id=artifact_id, path=path, max_depth=max_depth)
+                events[-1]["status"] = "success"
+                events[-1]["output"] = "returned tree summary"
+                tool_content = f"Tool result (artifact_get_tree):\n{_truncate_json(result, 5000)}"
+                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
+                transcript.append({"role": "user", "content": tool_content})
+            except Exception as exc:
+                events[-1]["status"] = "error"
+                events[-1]["output"] = _truncate_text(f"{type(exc).__name__}: {exc}", 220)
+                transcript.append(
+                    {
+                        "role": "user",
+                        "content": f"Tool error (artifact_get_tree): {type(exc).__name__}: {exc}",
+                    }
+                )
+            continue
+
+        if action_type == "artifact_search_text":
+            artifact_id = str(action.get("artifact_id", "")).strip()
+            query = str(action.get("query", "")).strip()
+            max_hits = int(action.get("max_hits", 20) or 20)
+            attempts.append(
+                f"step {step + 1}: artifact_search_text artifact_id={artifact_id or '<missing>'} query={_truncate_text(query, 60)}"
+            )
+            events.append(
+                {
+                    "step": str(step + 1),
+                    "type": "artifact_search_text",
+                    "reason": action_reason or "no reason provided",
+                    "input": f"artifact_id={artifact_id}, query={query}, max_hits={max_hits}",
+                    "status": "started",
+                    "output": "",
+                }
+            )
+            transcript.append({"role": "assistant", "content": json.dumps(action)})
+            try:
+                result = artifact_search_text(
+                    artifact_id=artifact_id, query=query, max_hits=max_hits
+                )
+                events[-1]["status"] = "success"
+                events[-1]["output"] = f"hit_count={result.get('hit_count', 0)}"
+                tool_content = f"Tool result (artifact_search_text):\n{_truncate_json(result, 5000)}"
+                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
+                transcript.append({"role": "user", "content": tool_content})
+            except Exception as exc:
+                events[-1]["status"] = "error"
+                events[-1]["output"] = _truncate_text(f"{type(exc).__name__}: {exc}", 220)
+                transcript.append(
+                    {
+                        "role": "user",
+                        "content": f"Tool error (artifact_search_text): {type(exc).__name__}: {exc}",
+                    }
+                )
+            continue
+
+        if action_type == "artifact_extract_path":
+            artifact_id = str(action.get("artifact_id", "")).strip()
+            path = str(action.get("path", "")).strip()
+            max_chars = int(action.get("max_chars", 4000) or 4000)
+            attempts.append(
+                f"step {step + 1}: artifact_extract_path artifact_id={artifact_id or '<missing>'} path={_truncate_text(path, 80)}"
+            )
+            events.append(
+                {
+                    "step": str(step + 1),
+                    "type": "artifact_extract_path",
+                    "reason": action_reason or "no reason provided",
+                    "input": f"artifact_id={artifact_id}, path={path}, max_chars={max_chars}",
+                    "status": "started",
+                    "output": "",
+                }
+            )
+            transcript.append({"role": "assistant", "content": json.dumps(action)})
+            try:
+                result = artifact_extract_path(
+                    artifact_id=artifact_id, path=path, max_chars=max_chars
+                )
+                events[-1]["status"] = "success"
+                events[-1]["output"] = f"value_type={result.get('value_type')}"
+                tool_content = f"Tool result (artifact_extract_path):\n{_truncate_json(result, 5000)}"
+                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
+                transcript.append({"role": "user", "content": tool_content})
+            except Exception as exc:
+                events[-1]["status"] = "error"
+                events[-1]["output"] = _truncate_text(f"{type(exc).__name__}: {exc}", 220)
+                transcript.append(
+                    {
+                        "role": "user",
+                        "content": f"Tool error (artifact_extract_path): {type(exc).__name__}: {exc}",
                     }
                 )
             continue
@@ -418,7 +595,7 @@ def _build_failure_summary(user_text: str, attempts: list[str], reason: str) -> 
     return "\n".join(lines)
 
 
-def _build_observability_blob(events: list[dict[str, str]]) -> str:
+def _build_observability_blob(events: list[dict[str, Any]]) -> str:
     lines = ["*Execution trace*"]
     if not events:
         lines.append("- No tool calls were executed.")
@@ -430,4 +607,91 @@ def _build_observability_blob(events: list[dict[str, str]]) -> str:
         )
         lines.append(f"  - Input: {event['input']}")
         lines.append(f"  - Output: {event['output']}")
+        model_preview = event.get("model_preview")
+        if isinstance(model_preview, str) and model_preview:
+            lines.append(f"  - Model preview: {model_preview}")
+        row_preview = event.get("rows_preview")
+        if isinstance(row_preview, list) and row_preview:
+            lines.append("  - First rows (up to 10):")
+            for row in row_preview:
+                lines.append(f"    - {row}")
     return "\n".join(lines)
+
+
+def _extract_rows_preview(result: dict[str, Any], max_rows: int = 10) -> list[str]:
+    records = result.get("records")
+    if not isinstance(records, list):
+        return []
+
+    preview: list[str] = []
+    for raw_record in records[:max_rows]:
+        cleaned = _strip_salesforce_attributes(raw_record)
+        dumped = json.dumps(cleaned, ensure_ascii=True)
+        preview.append(_truncate_text(dumped, 450))
+    return preview
+
+
+def _strip_salesforce_attributes(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            k: _strip_salesforce_attributes(v)
+            for k, v in value.items()
+            if k != "attributes"
+        }
+    if isinstance(value, list):
+        return [_strip_salesforce_attributes(item) for item in value]
+    return value
+
+
+def _materialize_result_for_model(result: Any, source: str, include_rows_preview: bool) -> dict[str, Any]:
+    size_bytes = _json_size_bytes(result)
+    rows_preview = _extract_rows_preview(result) if include_rows_preview else []
+    record_count = _record_count(result)
+    should_artifact = size_bytes >= ARTIFACT_MIN_BYTES or record_count >= ARTIFACT_MIN_RECORDS
+
+    if should_artifact:
+        artifact = artifact_store(result, source=source)
+        payload = {
+            "mode": "artifact",
+            "artifact": artifact,
+            "rows_preview": rows_preview,
+            "size_bytes": size_bytes,
+        }
+        return {
+            "mode": "artifact",
+            "artifact_id": artifact["artifact_id"],
+            "rows_preview": rows_preview,
+            "model_payload": json.dumps(payload, ensure_ascii=True),
+            "size_bytes": size_bytes,
+        }
+
+    payload = {
+        "mode": "inline",
+        "size_bytes": size_bytes,
+        "result": result,
+    }
+    return {
+        "mode": "inline",
+        "artifact_id": None,
+        "rows_preview": rows_preview,
+        "model_payload": _truncate_json(payload, 5000),
+        "size_bytes": size_bytes,
+    }
+
+
+def _materialized_output_summary(summary: str, materialized: dict[str, Any]) -> str:
+    if materialized["mode"] == "artifact":
+        return f"{summary} (artifact_id={materialized['artifact_id']}, size={materialized['size_bytes']} bytes)"
+    return f"{summary} (inline, size={materialized['size_bytes']} bytes)"
+
+
+def _json_size_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=True).encode("utf-8"))
+
+
+def _record_count(value: Any) -> int:
+    if isinstance(value, dict):
+        records = value.get("records")
+        if isinstance(records, list):
+            return len(records)
+    return 0
