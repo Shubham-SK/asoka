@@ -6,18 +6,27 @@ from dataclasses import dataclass
 from typing import Any
 from typing import Callable
 
-from app.agent.tools import artifact_store, sf_describe_object, sf_query_read_only, sf_tooling_query
+from app.agent.tools import artifact_search_text, artifact_store, sf_describe_object, sf_query_read_only, sf_tooling_query
 from app.config import Settings
 from app.db.enums import ConfidenceTier, KnowledgeKind, KnowledgeQuestionStatus
-from app.db.repository import create_knowledge_item
+from app.db.repository import (
+    create_knowledge_item,
+    delete_knowledge_item,
+    list_knowledge_items,
+    resolve_or_supersede_by_canonical_key,
+    update_knowledge_item,
+)
 from app.db.session import SessionLocal
 from app.llm.client import get_claude_client
+from app.llm.json_utils import extract_json_object
+from app.llm.json_utils import extract_text_response
+from app.llm.json_utils import repair_json_object_with_llm
+from app.salesforce.soql import ensure_read_only_select
 
 logger = logging.getLogger(__name__)
 INGESTION_LOG_PREVIEW_CHARS = 12000
-DISCOVERY_QUERY_LIMIT = 200
 DISCOVERY_ARTIFACT_THRESHOLD_CHARS = 5000
-TOOL_TRACE_MAX_STEPS = 80
+DISCOVERY_REPAIR_MAX_ATTEMPTS = 6
 
 
 @dataclass
@@ -26,77 +35,46 @@ class IngestionRunResult:
     message: str
     observability: str
 
+
+@dataclass
+class DiscoveryToolSpec:
+    key: str
+    tool_name: str
+    reason: str
+    api: str
+    query: str = ""
+    object_name: str = ""
+
+
+def _object_key_slug(object_name: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "_" for ch in object_name)
+
+
+def _soql_literal(value: str) -> str:
+    inner = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{inner}'"
+
+
 INGESTION_PROMPT = """
-You extract structured Salesforce knowledge from a completed read-agent response.
+You are the Salesforce knowledge ingestion agent.
+You have a compact toolset:
+- execute_soql (read/tooling)
+- describe_object
+- grep_artifact
+- kb_list, kb_create, kb_update, kb_delete
 
-Return ONLY valid JSON matching this shape:
-{
-  "facts": [
-    {
-      "title": "...",
-      "statement": "...",
-      "kind": "fact|rule|trend",
-      "source": "validation_rule|feature_behavior|naming_convention|automation_test",
-      "confidence_tier": "observed_trend|strict_violation",
-      "confidence_score": 0.0,
-      "sf_object_api_name": "Opportunity|null"
-    }
-  ],
-  "hypotheses": [
-    {
-      "title": "...",
-      "statement": "...",
-      "confidence_tier": "similar_past_approval|observed_trend",
-      "confidence_score": 0.0
-    }
-  ],
-  "questions": [
-    {
-      "title": "...",
-      "question": "...",
-      "why_needed": "...",
-      "blocking_policy": true
-    }
-  ]
-}
+Run metadata-first ingestion and keep persisting useful knowledge incrementally.
+Primary extraction objectives:
+1) Describe all objects and fields (including field labels, type, required/writeable, defaults, precision/scale, picklist options).
+2) Capture validation rules and hard constraints.
+3) For every discovered object, audit Tooling metadata beyond describe (FieldDefinition policy signals and per-object ValidationRule rows) for restrictions, required fields, deprecated fields, and rule inventory.
+4) Capture naming conventions and custom schema intent.
+5) Capture strictly typed semantics (picklists/enums and field-level limitations).
+6) Capture automation and behavior cues (tests, triggers, flows).
+7) Capture natural-language descriptions, warnings, limitations, and usage guidance tied to objects/fields/inputs.
 
-Rules:
-- Do not invent unsupported Salesforce facts.
-- Prefer concrete, atomic statements.
-- Keep confidence_score between 0 and 1.
-- For strict validation-rule-style constraints use confidence_tier=strict_violation.
-- For inferred behavior use confidence_tier=observed_trend or similar_past_approval.
-- Keep output compact and parseable. Use short titles and short statements.
-- Hard limits:
-  - facts: at most 12
-  - hypotheses: at most 6
-  - questions: 2 to 6 (prefer 3 to 5 when meaningful gaps exist)
-- Priority order for fact extraction (highest first):
-  1) Examine validation rules and hard constraints found in salesforce. Establish facts for each.
-  2) Examine feature behavior and object/field descriptions.
-  3) Review naming conventions and schema semantics.
-  4) Collect automation/test evidence (Apex tests, flows, triggers, coverage cues).
-- Omit operational app/workflow history entirely; learn from Salesforce instance metadata only.
-- Avoid "observed trend" style statements for now.
-- Questions should be specific to the current workspace.
-- Avoid questions that are related to the approval process or execution of plans.
-- Known policy (fixed): only the designated human co-worker can approve/auto-approve tasks; end-users cannot.
-- Do not generate facts, hypotheses, or questions that challenge or re-investigate this approval policy.
-- Prioritize asking questions that target policy, constraints, required inputs, and edge-case behavior.
-- If you observe similar or overlapping fields/columns (for example same object, similar names, or similar labels), ask about qualitative differences:
-  - when each field should be used
-  - business meaning distinctions
-  - boundary conditions and conflict resolution when both might apply
-- Prefer these qualitative-difference questions over generic process questions when both are possible.
-- Explicitly prioritize custom Salesforce items in questions:
-  - custom objects (`__c`)
-  - custom fields (`__c`)
-  - custom automation or integration-specific fields
-  - ask what business process each custom item supports and who owns its definition
-- Generate multiple high-quality questions that cover distinct uncertainty gaps.
-- Avoid near-duplicate questions; each should target a different policy or semantic ambiguity.
-- If validation-rule details are present in discovery context, convert them into concrete `kind="rule"` facts.
-- Do not ask questions that simply request the content of validation rules already provided in context.
+Output strict JSON with keys facts, hypotheses, questions.
+Prioritize completeness over brevity and avoid arbitrary caps.
 """
 
 
@@ -147,7 +125,8 @@ def ingest_read_response_into_kb(
             ),
         )
     client = get_claude_client()
-    discovery_contexts = _run_knowledge_discovery(
+    discovery_contexts, streamed_inserted, streamed_preview = _run_knowledge_discovery(
+        client=client,
         settings=settings,
         workspace_id=workspace_id,
         slack_user_id=slack_user_id,
@@ -156,35 +135,13 @@ def ingest_read_response_into_kb(
         parsed_intent=parsed_intent,
         parsed_intent_reason=parsed_intent_reason,
     )
-    stage_doc = _extract_knowledge_in_stages(
-        client=client,
-        settings=settings,
-        parsed_intent=parsed_intent,
-        parsed_intent_reason=parsed_intent_reason,
-        user_text=user_text,
-        discovery_contexts=discovery_contexts,
-        events=events,
-        progress_callback=progress_callback,
-    )
-    if stage_doc is None:
-        obs = _build_observability_blob(
-            events=events,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-            execution_plan=_ingestion_execution_plan(),
-        )
-        return IngestionRunResult(
-            status="error",
-            message=f"Knowledge ingestion JSON parse failed. Please retry.\n\n{obs}",
-            observability=obs,
-        )
     try:
         events.append(
             {
                 "step": _next_step(events),
-                "type": "persist_knowledge_items",
+                "type": "finalize_ingestion",
                 "status": "started",
-                "reason": "Persist extracted knowledge items into database.",
+                "reason": "Finalize ingestion and build user digest.",
             }
         )
         _emit_progress_update(
@@ -193,13 +150,10 @@ def ingest_read_response_into_kb(
             parsed_intent=parsed_intent,
             parsed_intent_reason=parsed_intent_reason,
         )
-        inserted, persisted_preview = _persist_ingestion_document(
-            workspace_id=workspace_id,
-            document=stage_doc,
-            max_items=settings.knowledge_ingestion_max_items,
-        )
+        inserted = streamed_inserted
+        persisted_preview = streamed_preview
         events[-1]["status"] = "success"
-        events[-1]["reason"] = f"Persisted {inserted} knowledge items."
+        events[-1]["reason"] = f"Persisted {inserted} knowledge items from incremental tool loop."
         _emit_progress_update(
             progress_callback=progress_callback,
             events=events,
@@ -252,14 +206,8 @@ def _persist_ingestion_document(
         "hypotheses": [],
         "questions": [],
     }
-    fact_cap, hypothesis_cap, question_cap = _ingestion_caps(max_items)
-    fact_inserted = 0
-    hypothesis_inserted = 0
-    question_inserted = 0
     with SessionLocal() as db:
         for item in facts:
-            if inserted >= max_items or fact_inserted >= fact_cap:
-                break
             if not isinstance(item, dict):
                 continue
             kind = _parse_kind(str(item.get("kind", "fact")).strip().lower())
@@ -281,7 +229,6 @@ def _persist_ingestion_document(
                 sf_object_api_name=_normalize_optional_text(item.get("sf_object_api_name")),
             )
             inserted += 1
-            fact_inserted += 1
             persisted_preview["facts"].append(
                 {
                     "title": title or "Extracted fact",
@@ -291,8 +238,6 @@ def _persist_ingestion_document(
             )
 
         for item in questions:
-            if inserted >= max_items or question_inserted >= question_cap:
-                break
             if not isinstance(item, dict):
                 continue
             question = str(item.get("question", "")).strip()
@@ -316,7 +261,6 @@ def _persist_ingestion_document(
                 question_status=KnowledgeQuestionStatus.open,
             )
             inserted += 1
-            question_inserted += 1
             persisted_preview["questions"].append(
                 {
                     "title": title or "Question",
@@ -326,8 +270,6 @@ def _persist_ingestion_document(
             )
 
         for item in hypotheses:
-            if inserted >= max_items or hypothesis_inserted >= hypothesis_cap:
-                break
             if not isinstance(item, dict):
                 continue
             tier = _parse_tier(str(item.get("confidence_tier", "similar_past_approval")).strip().lower())
@@ -347,7 +289,6 @@ def _persist_ingestion_document(
                 provenance={"pipeline": "read_ingestion"},
             )
             inserted += 1
-            hypothesis_inserted += 1
             persisted_preview["hypotheses"].append(
                 {
                     "title": title or "Hypothesis",
@@ -358,24 +299,194 @@ def _persist_ingestion_document(
     return inserted, persisted_preview
 
 
-def _ingestion_caps(max_items: int) -> tuple[int, int, int]:
-    budget = max(1, max_items)
-    facts = min(12, max(3, int(budget * 0.5)))
-    questions = min(6, max(2, int(budget * 0.25)))
-    remaining = budget - facts - questions
-    if remaining < 1:
-        deficit = 1 - remaining
-        reducible_facts = max(0, facts - 3)
-        cut_facts = min(deficit, reducible_facts)
-        facts -= cut_facts
-        deficit -= cut_facts
-        if deficit > 0:
-            reducible_questions = max(0, questions - 2)
-            cut_questions = min(deficit, reducible_questions)
-            questions -= cut_questions
-        remaining = budget - facts - questions
-    hypotheses = min(6, max(1, remaining))
-    return facts, hypotheses, questions
+def _validation_rule_knowledge_parts(item: dict[str, Any]) -> tuple[str, str, str | None, str]:
+    name = str(item.get("ValidationName", "")).strip() or "UnnamedValidationRule"
+    entity = item.get("EntityDefinition")
+    object_name = ""
+    if isinstance(entity, dict):
+        object_name = str(entity.get("QualifiedApiName", "")).strip()
+    display_field = str(item.get("ErrorDisplayField", "")).strip()
+    message = str(item.get("ErrorMessage", "")).strip()
+    formula = str(item.get("ErrorConditionFormula", "")).strip()
+    active = bool(item.get("Active", False))
+    description = str(item.get("Description", "")).strip()
+    parts = [
+        f"Validation rule `{name}` on `{object_name or 'unknown object'}`",
+        f"active={active}",
+    ]
+    if display_field:
+        parts.append(f"display_field={display_field}")
+    if message:
+        parts.append(f"error_message={message}")
+    if formula:
+        parts.append(f"formula={formula}")
+    if description:
+        parts.append(f"description={description}")
+    statement = "; ".join(parts)
+    title = f"Validation Rule: {object_name + '.' if object_name else ''}{name}"
+    canonical_key = f"validation_rule:{object_name or 'unknown'}:{name}"
+    return title, statement, _normalize_optional_text(object_name), canonical_key
+
+
+def _field_description_knowledge_parts(
+    object_name: str,
+    field: dict[str, Any],
+) -> tuple[str, str, str]:
+    api_name = str(field.get("name", "")).strip()
+    if not api_name:
+        return "", "", ""
+    label = str(field.get("label", "")).strip()
+    field_type = str(field.get("type", "")).strip()
+    required = (not bool(field.get("nillable", True))) and (not bool(field.get("defaultedOnCreate", False)))
+    custom = bool(field.get("custom", False))
+    createable = bool(field.get("createable", False))
+    updateable = bool(field.get("updateable", False))
+    picklist_values = field.get("picklistValues", [])
+    picks: list[str] = []
+    if isinstance(picklist_values, list):
+        for val in picklist_values:
+            if not isinstance(val, dict):
+                continue
+            value = str(val.get("value", "")).strip()
+            if value:
+                picks.append(value)
+    precision = field.get("precision")
+    scale = field.get("scale")
+    parts = [
+        f"Field `{object_name}.{api_name}`",
+        f"label={label or '<none>'}",
+        f"type={field_type or '<unknown>'}",
+        f"required={required}",
+        f"custom={custom}",
+        f"createable={createable}",
+        f"updateable={updateable}",
+    ]
+    if picks:
+        parts.append(f"picklist_values={','.join(picks)}")
+    if precision is not None:
+        parts.append(f"precision={precision}")
+    if scale is not None:
+        parts.append(f"scale={scale}")
+    statement = "; ".join(parts)
+    title = f"Field Description: {object_name}.{api_name}"
+    canonical_key = f"field_description:{object_name}:{api_name}"
+    return title, statement, canonical_key
+
+
+def _group_validation_rule_names_by_object(result: Any) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    records = result.get("records", []) if isinstance(result, dict) else []
+    if not isinstance(records, list):
+        return grouped
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        entity = item.get("EntityDefinition")
+        object_name = ""
+        if isinstance(entity, dict):
+            object_name = str(entity.get("QualifiedApiName", "")).strip()
+        rule_name = str(item.get("ValidationName", "")).strip()
+        if not object_name or not rule_name:
+            continue
+        grouped.setdefault(object_name, [])
+        if rule_name not in grouped[object_name]:
+            grouped[object_name].append(rule_name)
+    return grouped
+
+
+def _object_policy_knowledge_parts(
+    object_name: str,
+    describe: dict[str, Any],
+    validation_rule_names: list[str],
+) -> tuple[str, str, str]:
+    fields = describe.get("fields", []) if isinstance(describe, dict) else []
+    required_fields: list[str] = []
+    non_createable: list[str] = []
+    non_updateable: list[str] = []
+    restricted_picklists: list[str] = []
+    calculated_fields: list[str] = []
+    unique_fields: list[str] = []
+    if isinstance(fields, list):
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            api_name = str(field.get("name", "")).strip()
+            if not api_name:
+                continue
+            required = (not bool(field.get("nillable", True))) and (not bool(field.get("defaultedOnCreate", False)))
+            if required:
+                required_fields.append(api_name)
+            if not bool(field.get("createable", False)):
+                non_createable.append(api_name)
+            if not bool(field.get("updateable", False)):
+                non_updateable.append(api_name)
+            if bool(field.get("restrictedPicklist", False)):
+                restricted_picklists.append(api_name)
+            if bool(field.get("calculated", False)):
+                calculated_fields.append(api_name)
+            if bool(field.get("unique", False)) or bool(field.get("externalId", False)):
+                unique_fields.append(api_name)
+    parts = [
+        f"Object `{object_name}` policy audit",
+        f"queryable={bool(describe.get('queryable', False))}",
+        f"createable={bool(describe.get('createable', False))}",
+        f"updateable={bool(describe.get('updateable', False))}",
+        f"deletable={bool(describe.get('deletable', False))}",
+        f"required_field_count={len(required_fields)}",
+        f"restricted_picklist_count={len(restricted_picklists)}",
+        f"formula_field_count={len(calculated_fields)}",
+        f"validation_rule_count={len(validation_rule_names)}",
+    ]
+    if required_fields:
+        parts.append(f"required_fields={','.join(required_fields[:30])}")
+    if restricted_picklists:
+        parts.append(f"restricted_picklists={','.join(restricted_picklists[:30])}")
+    if validation_rule_names:
+        parts.append(f"validation_rules={','.join(validation_rule_names[:30])}")
+    if unique_fields:
+        parts.append(f"unique_or_external_id_fields={','.join(unique_fields[:30])}")
+    if non_createable:
+        parts.append(f"non_createable_field_count={len(non_createable)}")
+    if non_updateable:
+        parts.append(f"non_updateable_field_count={len(non_updateable)}")
+    title = f"Object Policy Audit: {object_name}"
+    statement = "; ".join(parts)
+    canonical_key = f"object_policy_audit:{object_name}"
+    return title, statement, canonical_key
+
+
+def _summarize_field_definition_policy_counts(records: list[Any]) -> tuple[int, int, int, int, int]:
+    total = 0
+    required = 0
+    restricted_picklist = 0
+    calculated = 0
+    deprecated = 0
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        if item.get("IsNillable") is False:
+            required += 1
+        if item.get("IsRestrictedPicklist") is True:
+            restricted_picklist += 1
+        if item.get("IsCalculated") is True:
+            calculated += 1
+        if item.get("IsDeprecatedAndHidden") is True:
+            deprecated += 1
+    return total, required, restricted_picklist, calculated, deprecated
+
+
+def _summarize_validation_rule_inventory(records: list[Any]) -> tuple[int, int, int]:
+    total = 0
+    active = 0
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        if item.get("Active") is True:
+            active += 1
+    inactive = total - active
+    return total, active, inactive
 
 
 def _parse_kind(raw: str) -> KnowledgeKind:
@@ -402,7 +513,500 @@ def _parse_score(value: Any) -> float:
     return max(0.0, min(score, 1.0))
 
 
+def _build_lossless_json_context(label: str, result: Any) -> str:
+    try:
+        rendered = json.dumps(result, ensure_ascii=True)
+    except Exception:
+        rendered = str(result)
+    return f"{label}:\n{rendered}"
+
+
+def _run_ingestion_tool(
+    *,
+    tool: str,
+    payload: dict[str, Any],
+    workspace_id: str,
+    slack_user_id: str,
+) -> Any:
+    if tool == "execute_soql":
+        api = str(payload.get("api", "read")).strip().lower()
+        query = str(payload.get("query", "")).strip()
+        if api == "tooling":
+            return sf_tooling_query(
+                query,
+                slack_user_id=slack_user_id or None,
+                workspace_id=workspace_id,
+            )
+        return sf_query_read_only(
+            query,
+            slack_user_id=slack_user_id or None,
+            workspace_id=workspace_id,
+        )
+    if tool == "describe_object":
+        object_name = str(payload.get("object_name", "")).strip()
+        return sf_describe_object(
+            object_name,
+            slack_user_id=slack_user_id or None,
+            workspace_id=workspace_id,
+        )
+    if tool == "grep_artifact":
+        artifact_id = str(payload.get("artifact_id", "")).strip()
+        query = str(payload.get("query", "")).strip()
+        max_hits = int(payload.get("max_hits", 40))
+        return artifact_search_text(artifact_id=artifact_id, query=query, max_hits=max_hits)
+    if tool == "kb_list":
+        limit = int(payload.get("limit", 25))
+        with SessionLocal() as db:
+            items = list_knowledge_items(db=db, workspace_id=workspace_id, limit=max(1, min(limit, 200)))
+            return {"count": len(items)}
+    if tool == "kb_create":
+        statement = str(payload.get("statement", "")).strip()
+        title = str(payload.get("title", "")).strip() or statement[:120] or "Knowledge"
+        kind_raw = str(payload.get("kind", "fact")).strip().lower()
+        kind = _parse_kind(kind_raw)
+        with SessionLocal() as db:
+            create_knowledge_item(
+                db=db,
+                workspace_id=workspace_id,
+                kind=kind,
+                confidence_tier=ConfidenceTier.coworker_context,
+                confidence_score=0.8,
+                title=title,
+                content={"statement": statement, "source_type": "read_ingestion"},
+                provenance={"pipeline": "read_ingestion_tools"},
+            )
+            db.commit()
+        return {"created": True}
+    if tool == "kb_update":
+        knowledge_id = str(payload.get("knowledge_id", "")).strip()
+        statement = _normalize_optional_text(payload.get("statement"))
+        title = _normalize_optional_text(payload.get("title"))
+        with SessionLocal() as db:
+            item = update_knowledge_item(
+                db=db,
+                workspace_id=workspace_id,
+                knowledge_id=knowledge_id,
+                title=title,
+                statement=statement,
+            )
+            db.commit()
+        return {"updated": bool(item)}
+    if tool == "kb_delete":
+        knowledge_id = str(payload.get("knowledge_id", "")).strip()
+        with SessionLocal() as db:
+            deleted = delete_knowledge_item(db=db, workspace_id=workspace_id, knowledge_id=knowledge_id)
+            db.commit()
+        return {"deleted": bool(deleted)}
+    raise ValueError(f"Unsupported ingestion tool: {tool}")
+
+
+def _build_discovery_tool_specs(object_names: list[str]) -> list[DiscoveryToolSpec]:
+    specs: list[DiscoveryToolSpec] = [
+        DiscoveryToolSpec(
+            key="validation_rules",
+            tool_name="tool_validation_rules",
+            reason="Capture validation rules and hard constraints.",
+            api="tooling",
+            query=(
+                "SELECT Id, EntityDefinition.QualifiedApiName, ValidationName, Active, Description, "
+                "ErrorMessage, ErrorDisplayField, ErrorConditionFormula FROM ValidationRule"
+            ),
+        ),
+        DiscoveryToolSpec(
+            key="naming_conventions",
+            tool_name="tool_custom_objects",
+            reason="Capture naming conventions and custom schema intent.",
+            api="read",
+            query="SELECT QualifiedApiName, Label FROM EntityDefinition WHERE IsCustomizable = true",
+        ),
+        DiscoveryToolSpec(
+            key="automation_apex_tests",
+            tool_name="tool_apex_tests",
+            reason="Capture automation behavior from Apex test inventory.",
+            api="tooling",
+            query="SELECT Id, Name FROM ApexClass WHERE Name LIKE '%Test%'",
+        ),
+        DiscoveryToolSpec(
+            key="automation_apex_triggers",
+            tool_name="tool_apex_triggers",
+            reason="Capture automation behavior from trigger inventory.",
+            api="tooling",
+            query="SELECT Id, Name, TableEnumOrId FROM ApexTrigger",
+        ),
+        DiscoveryToolSpec(
+            key="automation_flows",
+            tool_name="tool_flows",
+            reason="Capture automation behavior from flow definitions.",
+            api="tooling",
+            query="SELECT Id, DeveloperName, ActiveVersion.VersionNumber FROM FlowDefinition",
+        ),
+    ]
+    for object_name in object_names:
+        slug = _object_key_slug(object_name)
+        lit = _soql_literal(object_name)
+        specs.append(
+            DiscoveryToolSpec(
+                key=f"describe_{object_name.lower()}",
+                tool_name=f"tool_describe_{object_name.lower()}",
+                reason=f"Describe object {object_name} and all fields.",
+                api="describe",
+                object_name=object_name,
+            )
+        )
+        specs.append(
+            DiscoveryToolSpec(
+                key=f"object_policy_{slug}",
+                tool_name=f"tool_object_policy_{slug}",
+                reason=(
+                    f"Tooling FieldDefinition policy audit for {object_name} "
+                    "(required, restricted picklist, calculated, deprecated)."
+                ),
+                api="tooling",
+                query=(
+                    "SELECT QualifiedApiName, DataType, IsNillable, IsCalculated, IsRestrictedPicklist, "
+                    f"IsDeprecatedAndHidden FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = {lit}"
+                ),
+                object_name=object_name,
+            )
+        )
+        specs.append(
+            DiscoveryToolSpec(
+                key=f"object_validation_rules_{slug}",
+                tool_name=f"tool_object_validation_rules_{slug}",
+                reason=f"Tooling ValidationRule audit for {object_name}.",
+                api="tooling",
+                query=(
+                    "SELECT ValidationName, Active, Description, ErrorMessage, ErrorDisplayField "
+                    f"FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = {lit}"
+                ),
+                object_name=object_name,
+            )
+        )
+    return specs
+
+
+def _extract_object_names_from_catalog(result: Any) -> list[str]:
+    records = result.get("records", []) if isinstance(result, dict) else []
+    names: list[str] = []
+    if isinstance(records, list):
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            api_name = str(item.get("QualifiedApiName", "")).strip()
+            if api_name:
+                names.append(api_name)
+    for fallback in ["User", "Opportunity", "Account", "Lead", "Case"]:
+        if fallback not in names:
+            names.append(fallback)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append(name)
+    return deduped
+
+
+def _extend_preview(
+    target: dict[str, list[dict[str, str]]],
+    source: dict[str, list[dict[str, str]]],
+) -> None:
+    for key in ["facts", "hypotheses", "questions"]:
+        target.setdefault(key, [])
+        target[key].extend(source.get(key, []))
+
+
+def _run_discovery_spec(
+    *,
+    spec: DiscoveryToolSpec,
+    workspace_id: str,
+    slack_user_id: str,
+    events: list[dict[str, str]],
+    progress_callback: Callable[[str], None] | None,
+    parsed_intent: str,
+    parsed_intent_reason: str,
+) -> tuple[str, Any | None, str]:
+    events.append(
+        {
+            "step": _next_step(events),
+            "type": spec.tool_name,
+            "status": "started",
+            "reason": spec.reason,
+        }
+    )
+    _emit_progress_update(
+        progress_callback=progress_callback,
+        events=events,
+        parsed_intent=parsed_intent,
+        parsed_intent_reason=parsed_intent_reason,
+    )
+    try:
+        if spec.api == "describe":
+            result = _run_ingestion_tool(
+                tool="describe_object",
+                payload={"object_name": spec.object_name},
+                workspace_id=workspace_id,
+                slack_user_id=slack_user_id,
+            )
+        else:
+            result = _run_ingestion_tool(
+                tool="execute_soql",
+                payload={"api": spec.api, "query": spec.query},
+                workspace_id=workspace_id,
+                slack_user_id=slack_user_id,
+            )
+        summary = _summarize_result_count(result, spec.key)
+        context_text = _build_lossless_json_context(spec.key, result)
+        artifact_note = _maybe_store_discovery_artifact(result=result, tool_name=spec.tool_name)
+        artifact_id = _artifact_id_from_note(artifact_note)
+        if artifact_note:
+            summary = f"{summary}; {artifact_note}"
+            context_text = f"{context_text}\n{artifact_note}"
+        events[-1]["status"] = "success"
+        events[-1]["reason"] = summary
+        _emit_progress_update(
+            progress_callback=progress_callback,
+            events=events,
+            parsed_intent=parsed_intent,
+            parsed_intent_reason=parsed_intent_reason,
+        )
+        return context_text, result, artifact_id
+    except Exception as exc:
+        if spec.api in {"read", "tooling"} and spec.query:
+            repaired = _attempt_query_repair(
+                query_repair={
+                    "api": spec.api,
+                    "query": spec.query,
+                    "workspace_id": workspace_id,
+                    "slack_user_id": slack_user_id,
+                },
+                error=exc,
+                tool_name=spec.tool_name,
+                max_attempts=DISCOVERY_REPAIR_MAX_ATTEMPTS,
+            )
+            if repaired is not None:
+                result, repaired_query = repaired
+                summary = _summarize_result_count(result, spec.key)
+                context_text = _build_lossless_json_context(spec.key, result)
+                artifact_note = _maybe_store_discovery_artifact(result=result, tool_name=spec.tool_name)
+                artifact_id = _artifact_id_from_note(artifact_note)
+                if artifact_note:
+                    summary = f"{summary}; {artifact_note}"
+                    context_text = f"{context_text}\n{artifact_note}"
+                events[-1]["status"] = "success"
+                events[-1]["reason"] = (
+                    f"{summary}; repaired_query={_truncate_for_log(repaired_query, 180)}"
+                )
+                _emit_progress_update(
+                    progress_callback=progress_callback,
+                    events=events,
+                    parsed_intent=parsed_intent,
+                    parsed_intent_reason=parsed_intent_reason,
+                )
+                return context_text, result, artifact_id
+        events[-1]["status"] = "error"
+        events[-1]["reason"] = f"{spec.tool_name} failed: {type(exc).__name__}"
+        _emit_progress_update(
+            progress_callback=progress_callback,
+            events=events,
+            parsed_intent=parsed_intent,
+            parsed_intent_reason=parsed_intent_reason,
+        )
+        return f"{spec.tool_name} failed: {type(exc).__name__}", None, ""
+
+
+def _artifact_id_from_note(artifact_note: str) -> str:
+    text = str(artifact_note or "").strip()
+    if text.startswith("artifact_id="):
+        return text.split("=", 1)[1].strip()
+    return ""
+
+
+def _build_artifact_grep_context(
+    *,
+    artifact_id: str,
+    workspace_id: str,
+    slack_user_id: str,
+) -> str:
+    if not artifact_id:
+        return ""
+    queries = [
+        "required",
+        "picklist",
+        "validation",
+        "formula",
+        "warning",
+        "limit",
+        "deprecated",
+        "createable",
+        "updateable",
+    ]
+    lines = [f"artifact_grep:{artifact_id}"]
+    for query in queries:
+        try:
+            result = _run_ingestion_tool(
+                tool="grep_artifact",
+                payload={"artifact_id": artifact_id, "query": query, "max_hits": 25},
+                workspace_id=workspace_id,
+                slack_user_id=slack_user_id,
+            )
+        except Exception:
+            continue
+        hits = result.get("hits", []) if isinstance(result, dict) else []
+        if not isinstance(hits, list) or not hits:
+            continue
+        rendered_hits = []
+        for hit in hits[:12]:
+            if not isinstance(hit, dict):
+                continue
+            path = str(hit.get("path", "")).strip()
+            match = str(hit.get("match", "")).strip()
+            if path:
+                rendered_hits.append(f"{path}<{match or 'value'}>")
+        if rendered_hits:
+            lines.append(f"{query}: " + ", ".join(rendered_hits))
+    if len(lines) <= 1:
+        return ""
+    return "\n".join(lines)
+
+
+def _persist_deterministic_tool_knowledge(
+    *,
+    workspace_id: str,
+    spec: DiscoveryToolSpec,
+    result: Any,
+    validation_rule_names_by_object: dict[str, list[str]] | None = None,
+) -> tuple[int, dict[str, list[dict[str, str]]]]:
+    inserted = 0
+    preview: dict[str, list[dict[str, str]]] = {"facts": [], "hypotheses": [], "questions": []}
+    if not isinstance(result, dict):
+        return inserted, preview
+    with SessionLocal() as db:
+        if spec.key == "validation_rules":
+            records = result.get("records", [])
+            if isinstance(records, list):
+                for item in records:
+                    if not isinstance(item, dict):
+                        continue
+                    title, statement, _, canonical_key = _validation_rule_knowledge_parts(item)
+                    if not statement:
+                        continue
+                    resolve_or_supersede_by_canonical_key(
+                        db=db,
+                        workspace_id=workspace_id,
+                        salesforce_org_key="default",
+                        kind=KnowledgeKind.rule,
+                        canonical_key=canonical_key,
+                        replacement_content={"statement": statement, "source_type": "salesforce_metadata"},
+                        replacement_title=title,
+                        confidence_tier=ConfidenceTier.strict_violation,
+                        confidence_score=0.98,
+                        provenance={"pipeline": "read_ingestion_tools"},
+                    )
+                    inserted += 1
+                    preview["facts"].append({"title": title, "statement": statement, "kind": "rule"})
+        if spec.key.startswith("object_policy_") and spec.object_name:
+            records = result.get("records", [])
+            rec_list = records if isinstance(records, list) else []
+            tot, req_ct, rpick, calc, dep = _summarize_field_definition_policy_counts(rec_list)
+            statement = (
+                f"Object `{spec.object_name}` FieldDefinition tooling policy summary: "
+                f"field_count={tot}, required_field_count={req_ct} (IsNillable=false), "
+                f"restricted_picklist_count={rpick}, calculated_field_count={calc}, "
+                f"deprecated_hidden_field_count={dep}"
+            )
+            title = f"Object Policy Summary: {spec.object_name}"
+            canonical_key = f"object_policy_summary:{spec.object_name}"
+            resolve_or_supersede_by_canonical_key(
+                db=db,
+                workspace_id=workspace_id,
+                salesforce_org_key="default",
+                kind=KnowledgeKind.fact,
+                canonical_key=canonical_key,
+                replacement_content={"statement": statement, "source_type": "salesforce_metadata"},
+                replacement_title=title,
+                confidence_tier=ConfidenceTier.coworker_context,
+                confidence_score=0.95,
+                provenance={"pipeline": "read_ingestion_tools"},
+            )
+            inserted += 1
+            preview["facts"].append({"title": title, "statement": statement, "kind": "fact"})
+        if spec.key.startswith("object_validation_rules_") and spec.object_name:
+            records = result.get("records", [])
+            rec_list = records if isinstance(records, list) else []
+            tot, act, inact = _summarize_validation_rule_inventory(rec_list)
+            statement = (
+                f"Object `{spec.object_name}` ValidationRule tooling summary: "
+                f"total_rules={tot}, active_rules={act}, inactive_rules={inact}"
+            )
+            title = f"Object Validation Summary: {spec.object_name}"
+            canonical_key = f"object_validation_summary:{spec.object_name}"
+            resolve_or_supersede_by_canonical_key(
+                db=db,
+                workspace_id=workspace_id,
+                salesforce_org_key="default",
+                kind=KnowledgeKind.fact,
+                canonical_key=canonical_key,
+                replacement_content={"statement": statement, "source_type": "salesforce_metadata"},
+                replacement_title=title,
+                confidence_tier=ConfidenceTier.coworker_context,
+                confidence_score=0.95,
+                provenance={"pipeline": "read_ingestion_tools"},
+            )
+            inserted += 1
+            preview["facts"].append({"title": title, "statement": statement, "kind": "fact"})
+        if spec.api == "describe" and spec.object_name:
+            fields = result.get("fields", [])
+            if isinstance(fields, list):
+                for field in fields:
+                    if not isinstance(field, dict):
+                        continue
+                    title, statement, canonical_key = _field_description_knowledge_parts(spec.object_name, field)
+                    if not statement:
+                        continue
+                    resolve_or_supersede_by_canonical_key(
+                        db=db,
+                        workspace_id=workspace_id,
+                        salesforce_org_key="default",
+                        kind=KnowledgeKind.fact,
+                        canonical_key=canonical_key,
+                        replacement_content={"statement": statement, "source_type": "salesforce_metadata"},
+                        replacement_title=title,
+                        confidence_tier=ConfidenceTier.coworker_context,
+                        confidence_score=0.95,
+                        provenance={"pipeline": "read_ingestion_tools"},
+                    )
+                    inserted += 1
+                    preview["facts"].append({"title": title, "statement": statement, "kind": "fact"})
+            policy_title, policy_statement, policy_canonical_key = _object_policy_knowledge_parts(
+                spec.object_name,
+                result,
+                (validation_rule_names_by_object or {}).get(spec.object_name, []),
+            )
+            if policy_statement:
+                resolve_or_supersede_by_canonical_key(
+                    db=db,
+                    workspace_id=workspace_id,
+                    salesforce_org_key="default",
+                    kind=KnowledgeKind.rule,
+                    canonical_key=policy_canonical_key,
+                    replacement_content={"statement": policy_statement, "source_type": "salesforce_metadata"},
+                    replacement_title=policy_title,
+                    confidence_tier=ConfidenceTier.strict_violation,
+                    confidence_score=0.95,
+                    provenance={"pipeline": "read_ingestion_tools"},
+                )
+                inserted += 1
+                preview["facts"].append(
+                    {"title": policy_title, "statement": policy_statement, "kind": "rule"}
+                )
+        db.commit()
+    return inserted, preview
+
+
 def _run_knowledge_discovery(
+    client: Any,
     settings: Settings,
     workspace_id: str,
     slack_user_id: str,
@@ -410,576 +1014,171 @@ def _run_knowledge_discovery(
     progress_callback: Callable[[str], None] | None = None,
     parsed_intent: str = "",
     parsed_intent_reason: str = "",
-) -> dict[str, str]:
+) -> tuple[dict[str, str], int, dict[str, list[dict[str, str]]]]:
     chunks: dict[str, str] = {}
-
-    # 1) Validation rules and constraints
-    chunks["validation_rules"] = (
-        _call_discovery_tool(
-            events=events,
-            tool_name="tool_validation_rules",
-            reason="Look up active validation rules and constraints first.",
-            call=lambda: sf_tooling_query(
-                (
-                    "SELECT Id, EntityDefinition.QualifiedApiName, "
-                    "ValidationName, Active, Description, ErrorMessage "
-                    "FROM ValidationRule LIMIT 80"
-                ),
-                slack_user_id=slack_user_id or None,
-                workspace_id=workspace_id,
-            ),
-            summarize=_summarize_validation_rules,
-            context_builder=_build_validation_rules_context,
-            query_repair={
-                "api": "tooling",
-                "query": (
-                    "SELECT Id, EntityDefinition.QualifiedApiName, "
-                    "ValidationName, Active, Description, ErrorMessage "
-                    "FROM ValidationRule LIMIT 80"
-                ),
-                "workspace_id": workspace_id,
-                "slack_user_id": slack_user_id,
-            },
-            progress_callback=progress_callback,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-        )
+    streamed_inserted = 0
+    streamed_preview: dict[str, list[dict[str, str]]] = {"facts": [], "hypotheses": [], "questions": []}
+    validation_rule_names_by_object: dict[str, list[str]] = {}
+    object_catalog_spec = DiscoveryToolSpec(
+        key="object_catalog",
+        tool_name="tool_object_catalog",
+        reason="List all present queryable objects to drive complete per-object auditing.",
+        api="read",
+        query=(
+            "SELECT QualifiedApiName FROM EntityDefinition "
+            "WHERE IsQueryable = true AND IsDeprecatedAndHidden = false"
+        ),
     )
-
-    # 2) Feature behavior and object/field descriptions
-    for obj in ["User", "Opportunity", "Account", "Lead", "Case"]:
-        chunks[f"describe_{obj.lower()}"] = (
-            _call_discovery_tool(
-                events=events,
-                tool_name=f"tool_describe_{obj.lower()}",
-                reason=f"Describe {obj} behavior and field semantics.",
-                call=lambda obj_name=obj: sf_describe_object(
-                    obj_name,
-                    slack_user_id=slack_user_id or None,
-                    workspace_id=workspace_id,
-                ),
-                summarize=lambda result, obj_name=obj: _summarize_describe(result, obj_name),
-                context_builder=lambda result, obj_name=obj: _build_describe_context(result, obj_name),
-                progress_callback=progress_callback,
-                parsed_intent=parsed_intent,
-                parsed_intent_reason=parsed_intent_reason,
-            )
-        )
-
-    # 3) Naming conventions
-    chunks["naming_conventions"] = (
-        _call_discovery_tool(
-            events=events,
-            tool_name="tool_custom_objects",
-            reason="Review object naming conventions from custom objects.",
-            call=lambda: sf_query_read_only(
-                "SELECT QualifiedApiName, Label FROM EntityDefinition "
-                f"WHERE IsCustomizable = true LIMIT {DISCOVERY_QUERY_LIMIT}",
-                slack_user_id=slack_user_id or None,
-                workspace_id=workspace_id,
-            ),
-            summarize=_summarize_entity_definition_names,
-            context_builder=_build_naming_conventions_context,
-            query_repair={
-                "api": "read",
-                "query": (
-                    "SELECT QualifiedApiName, Label FROM EntityDefinition "
-                    f"WHERE IsCustomizable = true LIMIT {DISCOVERY_QUERY_LIMIT}"
-                ),
-                "workspace_id": workspace_id,
-                "slack_user_id": slack_user_id,
-            },
-            progress_callback=progress_callback,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-        )
-    )
-
-    # 4) Tests, flows, triggers
-    chunks["automation_apex_tests"] = (
-        _call_discovery_tool(
-            events=events,
-            tool_name="tool_apex_tests",
-            reason="Review Apex test inventory.",
-            call=lambda: sf_tooling_query(
-                f"SELECT Id, Name FROM ApexClass WHERE Name LIKE '%Test%' LIMIT {DISCOVERY_QUERY_LIMIT}",
-                slack_user_id=slack_user_id or None,
-                workspace_id=workspace_id,
-            ),
-            summarize=lambda result: _summarize_name_records(result, label="apex_tests"),
-            context_builder=lambda result: _build_name_records_context(result, "apex_tests"),
-            query_repair={
-                "api": "tooling",
-                "query": f"SELECT Id, Name FROM ApexClass WHERE Name LIKE '%Test%' LIMIT {DISCOVERY_QUERY_LIMIT}",
-                "workspace_id": workspace_id,
-                "slack_user_id": slack_user_id,
-            },
-            progress_callback=progress_callback,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-        )
-    )
-    chunks["automation_apex_triggers"] = (
-        _call_discovery_tool(
-            events=events,
-            tool_name="tool_apex_triggers",
-            reason="Review Apex trigger inventory.",
-            call=lambda: sf_tooling_query(
-                f"SELECT Id, Name, TableEnumOrId FROM ApexTrigger LIMIT {DISCOVERY_QUERY_LIMIT}",
-                slack_user_id=slack_user_id or None,
-                workspace_id=workspace_id,
-            ),
-            summarize=lambda result: _summarize_name_records(result, label="apex_triggers"),
-            context_builder=lambda result: _build_name_records_context(result, "apex_triggers"),
-            query_repair={
-                "api": "tooling",
-                "query": f"SELECT Id, Name, TableEnumOrId FROM ApexTrigger LIMIT {DISCOVERY_QUERY_LIMIT}",
-                "workspace_id": workspace_id,
-                "slack_user_id": slack_user_id,
-            },
-            progress_callback=progress_callback,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-        )
-    )
-    chunks["automation_flows"] = (
-        _call_discovery_tool(
-            events=events,
-            tool_name="tool_flows",
-            reason="Review active flow definitions.",
-            call=lambda: sf_tooling_query(
-                "SELECT Id, DeveloperName, ActiveVersion.VersionNumber "
-                f"FROM FlowDefinition LIMIT {DISCOVERY_QUERY_LIMIT}",
-                slack_user_id=slack_user_id or None,
-                workspace_id=workspace_id,
-            ),
-            summarize=_summarize_flows,
-            context_builder=_build_flows_context,
-            query_repair={
-                "api": "tooling",
-                "query": (
-                    "SELECT Id, DeveloperName, ActiveVersion.VersionNumber "
-                    f"FROM FlowDefinition LIMIT {DISCOVERY_QUERY_LIMIT}"
-                ),
-                "workspace_id": workspace_id,
-                "slack_user_id": slack_user_id,
-            },
-            progress_callback=progress_callback,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-        )
-    )
-
-    return chunks
-
-
-def _extract_knowledge_in_stages(
-    client: Any,
-    settings: Settings,
-    parsed_intent: str,
-    parsed_intent_reason: str,
-    user_text: str,
-    discovery_contexts: dict[str, str],
-    events: list[dict[str, str]],
-    progress_callback: Callable[[str], None] | None = None,
-) -> dict[str, Any] | None:
-    stage_plan = [
-        ("validation_rules", "validation_rule", 1200, 1),
-        ("feature_behavior", "feature_behavior", 1000, 2),
-        ("naming_conventions", "naming_convention", 900, 2),
-        ("automation_tests", "automation_test", 1000, 2),
-    ]
-    merged: dict[str, Any] = {"facts": [], "hypotheses": [], "questions": []}
-    parsed_any = False
-    for stage_name, source_label, stage_tokens, question_limit in stage_plan:
-        context = _compose_stage_context(stage_name=stage_name, discovery_contexts=discovery_contexts)
-        prompt = _build_stage_ingestion_prompt(
-            source_label=source_label,
-            question_limit=question_limit,
-        )
-        payload = (
-            "Request context:\n"
-            f"- parsed_intent: {parsed_intent}\n"
-            f"- parsed_intent_reason: {parsed_intent_reason}\n"
-            f"- user_text: {user_text}\n"
-            f"- stage: {stage_name}\n\n"
-            "Discovery context:\n"
-            f"{context}\n\n"
-            "Instructions:\n"
-            "- Learn from Salesforce metadata context only.\n"
-            "- Do not include app workflow/approval lifecycle content.\n"
-        )
-        events.append(
-            {
-                "step": _next_step(events),
-                "type": f"extract_{stage_name}",
-                "status": "started",
-                "reason": f"Extract stage-focused knowledge for {stage_name}.",
-            }
-        )
-        _emit_progress_update(
-            progress_callback=progress_callback,
-            events=events,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-        )
-        try:
-            response = client.messages.create(
-                model=settings.llm_model,
-                max_tokens=stage_tokens,
-                temperature=0,
-                system=prompt,
-                messages=[{"role": "user", "content": payload}],
-            )
-            events[-1]["status"] = "success"
-            _emit_progress_update(
-                progress_callback=progress_callback,
-                events=events,
-                parsed_intent=parsed_intent,
-                parsed_intent_reason=parsed_intent_reason,
-            )
-        except Exception as exc:
-            events[-1]["status"] = "error"
-            events[-1]["reason"] = f"LLM stage failed: {type(exc).__name__}"
-            logger.info("Knowledge ingestion stage call failed (%s): %s", stage_name, exc)
-            _emit_progress_update(
-                progress_callback=progress_callback,
-                events=events,
-                parsed_intent=parsed_intent,
-                parsed_intent_reason=parsed_intent_reason,
-            )
-            continue
-        raw = _extract_text_response(response)
-        events.append(
-            {
-                "step": _next_step(events),
-                "type": f"parse_{stage_name}",
-                "status": "started",
-                "reason": "Parse stage JSON payload.",
-            }
-        )
-        _emit_progress_update(
-            progress_callback=progress_callback,
-            events=events,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-        )
-        try:
-            doc = _extract_json_object(raw)
-            _merge_ingestion_docs(merged, doc)
-            parsed_any = True
-            events[-1]["status"] = "success"
-            _emit_progress_update(
-                progress_callback=progress_callback,
-                events=events,
-                parsed_intent=parsed_intent,
-                parsed_intent_reason=parsed_intent_reason,
-            )
-        except Exception as exc:
-            repaired = _retry_stage_parse_repair(
-                client=client,
-                settings=settings,
-                raw=raw,
-                stage_name=stage_name,
-                events=events,
-                progress_callback=progress_callback,
-                parsed_intent=parsed_intent,
-                parsed_intent_reason=parsed_intent_reason,
-            )
-            if repaired is not None:
-                _merge_ingestion_docs(merged, repaired)
-                parsed_any = True
-                events[-1]["status"] = "success"
-                events[-1]["reason"] = "Stage JSON parsed after repair retry."
-                _emit_progress_update(
-                    progress_callback=progress_callback,
-                    events=events,
-                    parsed_intent=parsed_intent,
-                    parsed_intent_reason=parsed_intent_reason,
-                )
-                continue
-            events[-1]["status"] = "error"
-            events[-1]["reason"] = "Stage JSON parse failed."
-            logger.info("Knowledge ingestion JSON parse failed for stage=%s: %s", stage_name, exc)
-            logger.info(
-                "Knowledge ingestion raw stage output (%s, len=%s):\n%s",
-                stage_name,
-                len(raw),
-                _truncate_for_log(raw, max_chars=INGESTION_LOG_PREVIEW_CHARS),
-            )
-            _emit_progress_update(
-                progress_callback=progress_callback,
-                events=events,
-                parsed_intent=parsed_intent,
-                parsed_intent_reason=parsed_intent_reason,
-            )
-            continue
-    if not parsed_any:
-        return None
-    return merged
-
-
-def _extract_text_response(response: Any) -> str:
-    text_parts: list[str] = []
-    for part in response.content:
-        if getattr(part, "type", "") == "text":
-            text_parts.append(part.text)
-    return "\n".join(text_parts).strip()
-
-
-def _compose_stage_context(stage_name: str, discovery_contexts: dict[str, str]) -> str:
-    if stage_name == "validation_rules":
-        return discovery_contexts.get("validation_rules", "")
-    if stage_name == "feature_behavior":
-        return "\n".join(
-            [
-                discovery_contexts.get("describe_opportunity", ""),
-                discovery_contexts.get("describe_account", ""),
-                discovery_contexts.get("describe_lead", ""),
-            ]
-        ).strip()
-    if stage_name == "naming_conventions":
-        return discovery_contexts.get("naming_conventions", "")
-    if stage_name == "automation_tests":
-        return "\n".join(
-            [
-                discovery_contexts.get("automation_apex_tests", ""),
-                discovery_contexts.get("automation_apex_triggers", ""),
-                discovery_contexts.get("automation_flows", ""),
-            ]
-        ).strip()
-    return ""
-
-
-def _build_stage_ingestion_prompt(source_label: str, question_limit: int) -> str:
-    if question_limit <= 0:
-        question_instruction = "- questions: [] (none)."
-    elif question_limit == 1:
-        question_instruction = "- questions: at most 1 high-value gap question."
-    else:
-        question_instruction = f"- questions: at most {question_limit} high-value gap questions."
-    return f"""
-You extract structured Salesforce knowledge from a completed read-agent response.
-
-Return ONLY valid JSON matching this shape:
-{{
-  "facts": [
-    {{
-      "title": "...",
-      "statement": "...",
-      "kind": "fact|rule",
-      "source": "{source_label}",
-      "confidence_tier": "strict_violation|coworker_context",
-      "confidence_score": 0.0,
-      "sf_object_api_name": "Opportunity|null"
-    }}
-  ],
-  "hypotheses": [
-    {{
-      "title": "...",
-      "statement": "...",
-      "confidence_tier": "strict_violation|coworker_context",
-      "confidence_score": 0.0
-    }}
-  ],
-  "questions": [
-    {{
-      "title": "...",
-      "question": "...",
-      "why_needed": "...",
-      "blocking_policy": true
-    }}
-  ]
-}}
-
-Rules:
-- Keep output compact and parseable.
-- facts: at most 4
-- hypotheses: at most 2
-{question_instruction}
-- Do not invent unsupported facts.
-- Prefer durable rules and constraints over timeline narration.
-- Treat validation rules, field requirements, picklist semantics, and automation evidence as primary facts.
-- Omit app workflow/approval lifecycle facts.
-- Avoid observed-trend framing.
-- Known policy (fixed): only the designated human co-worker can approve/auto-approve tasks; end-users cannot.
-- Do not generate facts, hypotheses, or questions that challenge or re-investigate this approval policy.
-- Keep confidence_score between 0 and 1.
-- If validation-rule details exist, convert them to kind=rule facts.
-- If rule details are present, do not ask questions requesting those same rule details.
-- If similar or overlapping fields are present, prioritize one question on qualitative differences
-  (when to use each field, business intent, and edge-case boundaries).
-- If custom items are present, make the question explicitly about custom items first
-  (custom objects/fields, their intended usage, ownership, and constraints).
-- Prefer multiple concise, non-overlapping questions over one broad generic question.
-"""
-
-
-def _merge_ingestion_docs(base: dict[str, Any], new_doc: dict[str, Any]) -> None:
-    for key in ["facts", "hypotheses", "questions"]:
-        items = new_doc.get(key, [])
-        if not isinstance(items, list):
-            continue
-        if key not in base or not isinstance(base[key], list):
-            base[key] = []
-        base[key].extend([item for item in items if isinstance(item, dict)])
-
-
-def _retry_stage_parse_repair(
-    client: Any,
-    settings: Settings,
-    raw: str,
-    stage_name: str,
-    events: list[dict[str, str]],
-    progress_callback: Callable[[str], None] | None,
-    parsed_intent: str,
-    parsed_intent_reason: str,
-) -> dict[str, Any] | None:
-    events.append(
-        {
-            "step": _next_step(events),
-            "type": f"repair_{stage_name}",
-            "status": "started",
-            "reason": "Repair malformed stage JSON using error-guided rewrite.",
-        }
-    )
-    _emit_progress_update(
-        progress_callback=progress_callback,
+    catalog_context, catalog_result, _ = _run_discovery_spec(
+        spec=object_catalog_spec,
+        workspace_id=workspace_id,
+        slack_user_id=slack_user_id,
         events=events,
+        progress_callback=progress_callback,
         parsed_intent=parsed_intent,
         parsed_intent_reason=parsed_intent_reason,
     )
-    repair_prompt = (
-        "You are a strict JSON repair tool. Convert the provided malformed output into valid JSON "
-        "with exactly keys: facts (array), hypotheses (array), questions (array). "
-        "Return JSON only, no markdown, no prose."
-    )
+    chunks[object_catalog_spec.key] = catalog_context
+    object_names = _extract_object_names_from_catalog(catalog_result)
+    discovery_specs = _build_discovery_tool_specs(object_names)
+
+    for spec in discovery_specs:
+        context_text, result, artifact_id = _run_discovery_spec(
+            spec=spec,
+            workspace_id=workspace_id,
+            slack_user_id=slack_user_id,
+            events=events,
+            progress_callback=progress_callback,
+            parsed_intent=parsed_intent,
+            parsed_intent_reason=parsed_intent_reason,
+        )
+        chunks[spec.key] = context_text
+        if spec.key == "validation_rules":
+            validation_rule_names_by_object = _group_validation_rule_names_by_object(result)
+
+        deterministic_added, deterministic_preview = _persist_deterministic_tool_knowledge(
+            workspace_id=workspace_id,
+            spec=spec,
+            result=result,
+            validation_rule_names_by_object=validation_rule_names_by_object,
+        )
+        streamed_inserted += deterministic_added
+        _extend_preview(streamed_preview, deterministic_preview)
+
+        if spec.api == "describe" and spec.object_name and isinstance(result, dict):
+            policy_title, policy_statement, _ = _object_policy_knowledge_parts(
+                spec.object_name,
+                result,
+                validation_rule_names_by_object.get(spec.object_name, []),
+            )
+            policy_chunk_key = f"policy_audit_{spec.object_name.lower()}"
+            policy_chunk_text = (
+                f"{policy_chunk_key}:\n"
+                f"title={policy_title}\n"
+                f"statement={policy_statement}"
+            )
+            chunks[policy_chunk_key] = policy_chunk_text
+            policy_added, policy_preview = _extract_and_persist_chunk_knowledge(
+                client=client,
+                settings=settings,
+                workspace_id=workspace_id,
+                chunk_label=policy_chunk_key,
+                chunk_text=policy_chunk_text,
+            )
+            streamed_inserted += policy_added
+            _extend_preview(streamed_preview, policy_preview)
+
+        llm_added, llm_preview = _extract_and_persist_chunk_knowledge(
+            client=client,
+            settings=settings,
+            workspace_id=workspace_id,
+            chunk_label=spec.key,
+            chunk_text=context_text,
+        )
+        streamed_inserted += llm_added
+        _extend_preview(streamed_preview, llm_preview)
+
+        artifact_grep = _build_artifact_grep_context(
+            artifact_id=artifact_id,
+            workspace_id=workspace_id,
+            slack_user_id=slack_user_id,
+        )
+        if artifact_grep:
+            grep_key = f"{spec.key}_artifact_grep"
+            chunks[grep_key] = artifact_grep
+            grep_added, grep_preview = _extract_and_persist_chunk_knowledge(
+                client=client,
+                settings=settings,
+                workspace_id=workspace_id,
+                chunk_label=grep_key,
+                chunk_text=artifact_grep,
+            )
+            streamed_inserted += grep_added
+            _extend_preview(streamed_preview, grep_preview)
+        logger.info(
+            "Discovery step persisted: key=%s deterministic=%s llm=%s",
+            spec.key,
+            deterministic_added,
+            llm_added,
+        )
+
+    return chunks, streamed_inserted, streamed_preview
+
+
+def _extract_and_persist_chunk_knowledge(
+    client: Any,
+    settings: Settings,
+    workspace_id: str,
+    chunk_label: str,
+    chunk_text: str,
+) -> tuple[int, dict[str, list[dict[str, str]]]]:
+    if not chunk_text or " failed:" in chunk_text.lower():
+        return 0, {"facts": [], "hypotheses": [], "questions": []}
+    system_prompt = """
+You extract structured knowledge from one Salesforce metadata chunk.
+Return strict JSON only:
+{
+  "facts":[{"title":"...","statement":"...","kind":"fact|rule","confidence_tier":"strict_violation|coworker_context","confidence_score":0.0,"sf_object_api_name":"Opportunity|null"}],
+  "hypotheses":[{"title":"...","statement":"...","confidence_tier":"coworker_context","confidence_score":0.0}],
+  "questions":[{"title":"...","question":"...","why_needed":"...","blocking_policy":true}]
+}
+Rules:
+- Include as many concrete policies/constraints as present.
+- Extraction priority in this chunk:
+  1) explicit validation/constraint statements
+  2) object/field semantics (required, type, picklist, writeability)
+  3) naming and custom-schema intent
+  4) automation implications
+- Include object/field API names whenever available.
+- No markdown, no prose outside JSON.
+"""
+    payload = f"chunk_label={chunk_label}\n\nchunk_data:\n{chunk_text}"
     try:
         response = client.messages.create(
             model=settings.llm_model,
-            max_tokens=1000,
+            max_tokens=1200,
             temperature=0,
-            system=repair_prompt,
-            messages=[{"role": "user", "content": raw[:7000]}],
+            system=system_prompt,
+            messages=[{"role": "user", "content": payload}],
         )
-        repaired_raw = _extract_text_response(response)
-        repaired_doc = _extract_json_object(repaired_raw)
-        events[-1]["status"] = "success"
-        events[-1]["reason"] = "Repair retry returned valid JSON."
-        return repaired_doc
+        raw = extract_text_response(response)
+        doc = extract_json_object(raw)
+        inserted, preview = _persist_ingestion_document(
+            workspace_id=workspace_id,
+            document=doc,
+            max_items=1000000,
+        )
+        return inserted, preview
     except Exception as exc:
-        events[-1]["status"] = "error"
-        events[-1]["reason"] = f"Repair retry failed: {type(exc).__name__}"
-        logger.info("Knowledge ingestion JSON repair retry failed for stage=%s: %s", stage_name, exc)
-        return None
-    finally:
-        _emit_progress_update(
-            progress_callback=progress_callback,
-            events=events,
-            parsed_intent=parsed_intent,
-            parsed_intent_reason=parsed_intent_reason,
-        )
-
-
-def _call_discovery_tool(
-    events: list[dict[str, str]],
-    tool_name: str,
-    reason: str,
-    call: Any,
-    summarize: Any,
-    context_builder: Any | None = None,
-    retry_calls: list[tuple[str, Any]] | None = None,
-    query_repair: dict[str, str] | None = None,
-    progress_callback: Callable[[str], None] | None = None,
-    parsed_intent: str = "",
-    parsed_intent_reason: str = "",
-) -> str:
-    events.append(
-        {
-            "step": _next_step(events),
-            "type": tool_name,
-            "status": "started",
-            "reason": reason,
-        }
-    )
-    _emit_progress_update(
-        progress_callback=progress_callback,
-        events=events,
-        parsed_intent=parsed_intent,
-        parsed_intent_reason=parsed_intent_reason,
-    )
-    attempts: list[tuple[str, Any]] = [("primary", call)]
-    if retry_calls:
-        attempts.extend(retry_calls)
-    last_exc: Exception | None = None
-    for idx, (attempt_name, attempt_call) in enumerate(attempts):
-        try:
-            result = attempt_call()
-            summary = summarize(result)
-            context_text = context_builder(result) if context_builder is not None else summary
-            artifact_note = _maybe_store_discovery_artifact(result=result, tool_name=tool_name)
-            if artifact_note:
-                summary = f"{summary}; {artifact_note}"
-                context_text = f"{context_text}; {artifact_note}"
-            if idx > 0:
-                summary = f"{summary}; retry={attempt_name}"
-            events[-1]["status"] = "success"
-            events[-1]["reason"] = summary
-            _emit_progress_update(
-                progress_callback=progress_callback,
-                events=events,
-                parsed_intent=parsed_intent,
-                parsed_intent_reason=parsed_intent_reason,
-            )
-            return f"{tool_name}: {context_text}"
-        except Exception as exc:
-            last_exc = exc
-            if idx < len(attempts) - 1:
-                events[-1]["reason"] = (
-                    f"{tool_name} attempt failed ({type(exc).__name__}); retrying with {attempts[idx + 1][0]}"
-                )
-                _emit_progress_update(
-                    progress_callback=progress_callback,
-                    events=events,
-                    parsed_intent=parsed_intent,
-                    parsed_intent_reason=parsed_intent_reason,
-                )
-                continue
-            if query_repair is not None:
-                repaired = _attempt_query_repair(query_repair=query_repair, error=exc, tool_name=tool_name)
-                if repaired is not None:
-                    result, repaired_query = repaired
-                    summary = summarize(result)
-                    context_text = context_builder(result) if context_builder is not None else summary
-                    artifact_note = _maybe_store_discovery_artifact(result=result, tool_name=tool_name)
-                    if artifact_note:
-                        summary = f"{summary}; {artifact_note}"
-                        context_text = f"{context_text}; {artifact_note}"
-                    events[-1]["status"] = "success"
-                    events[-1]["reason"] = f"{summary}; repaired_query={_truncate_for_log(repaired_query, 180)}"
-                    _emit_progress_update(
-                        progress_callback=progress_callback,
-                        events=events,
-                        parsed_intent=parsed_intent,
-                        parsed_intent_reason=parsed_intent_reason,
-                    )
-                    return f"{tool_name}: {context_text}"
-    msg = f"{tool_name} failed: {type(last_exc).__name__ if last_exc else 'UnknownError'}"
-    events[-1]["status"] = "error"
-    events[-1]["reason"] = msg
-    _emit_progress_update(
-        progress_callback=progress_callback,
-        events=events,
-        parsed_intent=parsed_intent,
-        parsed_intent_reason=parsed_intent_reason,
-    )
-    return msg
+        logger.info("Chunk-level extraction/persist failed for %s: %s", chunk_label, exc)
+        return 0, {"facts": [], "hypotheses": [], "questions": []}
 
 
 def _attempt_query_repair(
     query_repair: dict[str, str],
     error: Exception,
     tool_name: str,
+    max_attempts: int = 1,
 ) -> tuple[dict[str, Any], str] | None:
     api = str(query_repair.get("api", "")).strip().lower()
     original_query = str(query_repair.get("query", "")).strip()
@@ -987,234 +1186,62 @@ def _attempt_query_repair(
     slack_user_id = str(query_repair.get("slack_user_id", "")).strip()
     if api not in {"tooling", "read"} or not original_query:
         return None
-    try:
-        client = get_claude_client()
-        repair_prompt = (
-            "You are a SOQL repair helper. Given a failed query and error, return ONLY JSON "
-            "with shape {\"query\":\"SELECT ...\"}. Keep it read-only and valid for the same intent."
-        )
-        repair_input = (
-            f"tool={tool_name}\n"
-            f"api={api}\n"
-            f"error={type(error).__name__}: {error}\n"
-            f"failed_query={original_query}\n"
-            "Return only corrected read-only SELECT SOQL."
-        )
-        response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=600,
-            temperature=0,
-            system=repair_prompt,
-            messages=[{"role": "user", "content": repair_input}],
-        )
-        repaired_raw = _extract_text_response(response)
-        repaired_payload = _extract_json_object(repaired_raw)
-        repaired_query = str(repaired_payload.get("query", "")).strip()
-        if not repaired_query.lower().startswith("select"):
-            return None
-        if api == "tooling":
-            result = sf_tooling_query(
+    client = get_claude_client()
+    attempts = max(1, int(max_attempts))
+    failed_query = original_query
+    last_error: Exception = error
+    for attempt in range(1, attempts + 1):
+        try:
+            repair_input = (
+                f"tool={tool_name}\n"
+                f"api={api}\n"
+                f"error={type(last_error).__name__}: {last_error}\n"
+                f"failed_query={failed_query}\n"
+                "Return only corrected read-only SELECT SOQL."
+            )
+            repaired_payload = repair_json_object_with_llm(
+                client=client,
+                model="claude-3-5-haiku-20241022",
+                raw_text=repair_input,
+                schema_hint='{"query":"SELECT ..."} read-only SOQL preserving original intent',
+                max_tokens=700,
+            )
+            if repaired_payload is None:
+                raise RuntimeError("repair returned no query payload")
+            repaired_query = str(repaired_payload.get("query", "")).strip()
+            repaired_query = ensure_read_only_select(repaired_query, context="SOQL")
+            if api == "tooling":
+                result = sf_tooling_query(
+                    repaired_query,
+                    slack_user_id=slack_user_id or None,
+                    workspace_id=workspace_id or None,
+                )
+                return result, repaired_query
+            result = sf_query_read_only(
                 repaired_query,
                 slack_user_id=slack_user_id or None,
                 workspace_id=workspace_id or None,
             )
             return result, repaired_query
-        result = sf_query_read_only(
-            repaired_query,
-            slack_user_id=slack_user_id or None,
-            workspace_id=workspace_id or None,
-        )
-        return result, repaired_query
-    except Exception as repair_exc:
-        logger.info("SOQL repair attempt failed for %s: %s", tool_name, repair_exc)
-        return None
+        except Exception as repair_exc:
+            last_error = repair_exc
+            if "repaired_query" in locals() and str(locals()["repaired_query"]).strip():
+                failed_query = str(locals()["repaired_query"]).strip()
+            logger.info(
+                "SOQL repair attempt %s/%s failed for %s: %s",
+                attempt,
+                attempts,
+                tool_name,
+                repair_exc,
+            )
+            continue
+    return None
 
 
-def _summarize_validation_rules(result: dict[str, Any]) -> str:
+def _summarize_result_count(result: dict[str, Any], label: str) -> str:
     records = result.get("records", []) if isinstance(result, dict) else []
     count = len(records) if isinstance(records, list) else 0
-    return f"validation_rules={count}"
-
-
-def _build_validation_rules_context(result: dict[str, Any]) -> str:
-    records = result.get("records", []) if isinstance(result, dict) else []
-    if not isinstance(records, list) or not records:
-        return "validation_rules=0"
-    lines = [f"validation_rules={len(records)}"]
-    for item in records[:50]:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("ValidationName", "")).strip() or "UnnamedRule"
-        display_field = str(item.get("ErrorDisplayField", "")).strip() or "<none>"
-        message = str(item.get("ErrorMessage", "")).strip() or "<none>"
-        formula = str(item.get("ErrorConditionFormula", "")).strip()
-        object_name = "<unknown>"
-        entity = item.get("EntityDefinition")
-        if isinstance(entity, dict):
-            object_name = str(entity.get("QualifiedApiName", "")).strip() or "<unknown>"
-        formula_preview = formula.replace("\n", " ").strip()
-        if len(formula_preview) > 160:
-            formula_preview = formula_preview[:157] + "..."
-        if len(message) > 140:
-            message = message[:137] + "..."
-        lines.append(
-            f"- rule={name}; object={object_name}; display_field={display_field}; "
-            f"message={message}; formula={formula_preview or '<none>'}"
-        )
-    return "\n".join(lines)
-
-
-def _summarize_describe(result: dict[str, Any], object_name: str) -> str:
-    fields = result.get("fields", []) if isinstance(result, dict) else []
-    field_count = len(fields) if isinstance(fields, list) else 0
-    return f"{object_name} fields={field_count}"
-
-
-def _build_describe_context(result: dict[str, Any], object_name: str) -> str:
-    if not isinstance(result, dict):
-        return f"{object_name}: describe unavailable"
-    fields = result.get("fields", [])
-    if not isinstance(fields, list):
-        fields = []
-    required_fields: list[str] = []
-    picklist_notes: list[str] = []
-    numeric_constraints: list[str] = []
-    naming_examples: list[str] = []
-    for field in fields:
-        if not isinstance(field, dict):
-            continue
-        api_name = str(field.get("name", "")).strip()
-        label = str(field.get("label", "")).strip()
-        if not api_name:
-            continue
-        if not bool(field.get("nillable", True)) and not bool(field.get("defaultedOnCreate", False)):
-            required_fields.append(api_name)
-        field_type = str(field.get("type", "")).strip().lower()
-        if field_type == "picklist":
-            values = field.get("picklistValues", [])
-            picks: list[str] = []
-            if isinstance(values, list):
-                for val in values[:8]:
-                    if isinstance(val, dict) and bool(val.get("active", True)):
-                        picks.append(str(val.get("value", "")).strip())
-            if picks:
-                picklist_notes.append(f"{api_name}={','.join([p for p in picks if p])}")
-        if field_type in {"currency", "double", "percent", "int"}:
-            precision = field.get("precision")
-            scale = field.get("scale")
-            if precision is not None:
-                numeric_constraints.append(f"{api_name}(precision={precision},scale={scale})")
-        if label and api_name.endswith("__c"):
-            naming_examples.append(f"{api_name}:{label}")
-
-    lines = [
-        f"{object_name} describe:",
-        f"- required_fields: {', '.join(required_fields[:20]) or '<none>'}",
-        f"- picklists: {'; '.join(picklist_notes[:10]) or '<none>'}",
-        f"- numeric_constraints: {'; '.join(numeric_constraints[:10]) or '<none>'}",
-        f"- custom_field_naming_examples: {'; '.join(naming_examples[:12]) or '<none>'}",
-    ]
-    return "\n".join(lines)
-
-
-def _summarize_entity_definition_names(result: dict[str, Any]) -> str:
-    records = result.get("records", []) if isinstance(result, dict) else []
-    names: list[str] = []
-    if isinstance(records, list):
-        for item in records[:25]:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("QualifiedApiName", "")).strip()
-            if name:
-                names.append(name)
-    return f"custom_objects={len(records) if isinstance(records, list) else 0}; sample={','.join(names)}"
-
-
-def _build_naming_conventions_context(result: dict[str, Any]) -> str:
-    records = result.get("records", []) if isinstance(result, dict) else []
-    if not isinstance(records, list):
-        return "naming_conventions: unavailable"
-    custom_suffix_count = 0
-    title_case_like = 0
-    examples: list[str] = []
-    for item in records[:80]:
-        if not isinstance(item, dict):
-            continue
-        api_name = str(item.get("QualifiedApiName", "")).strip()
-        label = str(item.get("Label", "")).strip()
-        if not api_name:
-            continue
-        if api_name.endswith("__c"):
-            custom_suffix_count += 1
-        if label and label[:1].isupper():
-            title_case_like += 1
-        if len(examples) < 20:
-            examples.append(f"{api_name}:{label}")
-    total = len(records)
-    return (
-        "naming_conventions:\n"
-        f"- total_objects: {total}\n"
-        f"- custom_suffix_objects: {custom_suffix_count}\n"
-        f"- title_case_label_ratio: {title_case_like}/{max(total, 1)}\n"
-        f"- object_examples: {'; '.join(examples) or '<none>'}"
-    )
-
-
-def _summarize_name_records(result: dict[str, Any], label: str) -> str:
-    records = result.get("records", []) if isinstance(result, dict) else []
-    names: list[str] = []
-    if isinstance(records, list):
-        for item in records[:25]:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("Name", "")).strip()
-            if name:
-                names.append(name)
-    return f"{label}={len(records) if isinstance(records, list) else 0}; sample={','.join(names)}"
-
-
-def _build_name_records_context(result: dict[str, Any], label: str) -> str:
-    records = result.get("records", []) if isinstance(result, dict) else []
-    if not isinstance(records, list):
-        return f"{label}: unavailable"
-    names: list[str] = []
-    for item in records[:50]:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("Name", "")).strip()
-        if name:
-            names.append(name)
-    return f"{label}:\n- count: {len(records)}\n- names: {', '.join(names) or '<none>'}"
-
-
-def _summarize_flows(result: dict[str, Any]) -> str:
-    records = result.get("records", []) if isinstance(result, dict) else []
-    names: list[str] = []
-    if isinstance(records, list):
-        for item in records[:25]:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("DeveloperName", "")).strip()
-            if name:
-                names.append(name)
-    return f"flows={len(records) if isinstance(records, list) else 0}; sample={','.join(names)}"
-
-def _build_flows_context(result: dict[str, Any]) -> str:
-    records = result.get("records", []) if isinstance(result, dict) else []
-    if not isinstance(records, list):
-        return "flows: unavailable"
-    names: list[str] = []
-    for item in records[:50]:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("DeveloperName", "")).strip()
-        version_obj = item.get("ActiveVersion")
-        version = ""
-        if isinstance(version_obj, dict):
-            version = str(version_obj.get("VersionNumber", "")).strip()
-        if name:
-            names.append(f"{name}(v{version or '?'})")
-    return f"flows:\n- count: {len(records)}\n- active_versions: {', '.join(names) or '<none>'}"
+    return f"{label}={count}"
 
 
 def _normalize_optional_text(value: Any) -> str | None:
@@ -1234,23 +1261,23 @@ def _build_persisted_items_digest(persisted: dict[str, list[dict[str, str]]]) ->
     hypotheses = persisted.get("hypotheses", [])
     questions = persisted.get("questions", [])
     if facts:
-        lines.append("Facts / Rules:")
-        for item in facts:
+        lines.append(f"Facts / Rules (showing first 5 of {len(facts)}):")
+        for item in facts[:5]:
             kind = str(item.get("kind", "fact")).strip()
             title = str(item.get("title", "Untitled")).strip() or "Untitled"
             statement = str(item.get("statement", "")).strip()
             if statement:
                 lines.append(f"- [{kind}] {title}: {statement}")
     if hypotheses:
-        lines.append("Hypotheses:")
-        for item in hypotheses:
+        lines.append(f"Hypotheses (showing first 5 of {len(hypotheses)}):")
+        for item in hypotheses[:5]:
             title = str(item.get("title", "Untitled")).strip() or "Untitled"
             statement = str(item.get("statement", "")).strip()
             if statement:
                 lines.append(f"- {title}: {statement}")
     if questions:
-        lines.append("Questions:")
-        for item in questions:
+        lines.append(f"Questions (showing first 5 of {len(questions)}):")
+        for item in questions[:5]:
             title = str(item.get("title", "Untitled")).strip() or "Untitled"
             question = str(item.get("question", "")).strip()
             if question:
@@ -1260,71 +1287,11 @@ def _build_persisted_items_digest(persisted: dict[str, list[dict[str, str]]]) ->
     return "\n".join(lines)
 
 
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    normalized = _normalize_json_like_text(raw_text)
-    attempts = [normalized]
-    last_exc: Exception | None = None
-    for attempt in attempts:
-        try:
-            return json.loads(attempt)
-        except json.JSONDecodeError as exc:
-            last_exc = exc
-            candidate = _extract_first_json_object_text(attempt)
-            if candidate is None:
-                continue
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError as inner_exc:
-                last_exc = inner_exc
-                continue
-    raise RuntimeError("Invalid ingestion JSON from model output.") from last_exc
-
-
-def _normalize_json_like_text(raw_text: str) -> str:
-    text = raw_text.strip().replace("\u00a0", " ")
-    if text.startswith("```"):
-        text = text.strip("`")
-        text = text.replace("json", "", 1).strip()
-    return text
-
-
 def _truncate_for_log(text: str, max_chars: int = INGESTION_LOG_PREVIEW_CHARS) -> str:
     if len(text) <= max_chars:
         return text
     omitted = len(text) - max_chars
     return text[:max_chars] + f"\n... [truncated log output, omitted {omitted} chars]"
-
-
-def _extract_first_json_object_text(raw_text: str) -> str | None:
-    start = raw_text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for idx in range(start, len(raw_text)):
-        ch = raw_text[idx]
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            depth += 1
-            continue
-        if ch == "}":
-            depth -= 1
-            if depth == 0:
-                return raw_text[start : idx + 1]
-    return None
 
 
 def _build_observability_blob(
@@ -1373,27 +1340,13 @@ def _emit_progress_update(
         logger.info("Could not emit ingestion progress update: %s", exc)
 
 
-def _build_tool_calls_observability(events: list[dict[str, str]]) -> str:
-    tool_events = [e for e in events if str(e.get("type", "")).startswith("tool_")]
-    lines = ["Execution trace"]
-    if not tool_events:
-        lines.append("- No tool calls were executed.")
-        return "```\n" + "\n".join(lines) + "\n```"
-    for event in tool_events[:TOOL_TRACE_MAX_STEPS]:
-        lines.append(
-            f"- Step {event['step']} [{event['type']} | {event['status']}]: {event['reason']}"
-        )
-    if len(tool_events) > TOOL_TRACE_MAX_STEPS:
-        lines.append(f"- ... and {len(tool_events) - TOOL_TRACE_MAX_STEPS} more tool call(s)")
-    return "```\n" + "\n".join(lines) + "\n```"
-
-
 def _ingestion_execution_plan() -> list[str]:
     return [
-        "Classify ingestion intent and set metadata-first scope.",
-        "Run Salesforce discovery tools for validation rules, describes, naming, and automation metadata.",
-        "Extract structured knowledge per stage with strict JSON.",
-        "Persist facts/rules, hypotheses, and questions to database.",
+        "Build metadata-first discovery scope (object catalog + describe coverage).",
+        "Run per-object policy audits (Tooling FieldDefinition + ValidationRule per object) alongside describe.",
+        "Execute centralized ingestion tools (SOQL, describe, artifact grep).",
+        "Extract and persist knowledge incrementally after each tool output.",
+        "Upsert deterministic rule/field knowledge for validation, describe, and policy-summary results.",
         "Return human-readable persisted output.",
     ]
 

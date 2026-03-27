@@ -186,6 +186,16 @@ def register_handlers(slack_app, settings: Settings) -> None:
                     slack_ts=str(posted_followup.get("ts", "") or ""),
                 )
 
+        def persist_assistant_message(message_text: str, slack_ts: str) -> None:
+            _append_message_to_db(
+                workspace_id=workspace_id,
+                slack_user_id=user_id,
+                channel_id=channel_id,
+                role="assistant",
+                text=message_text,
+                slack_ts=slack_ts,
+            )
+
         response = orchestrator.handle_message(
             user_id=user_id,
             text=text,
@@ -200,28 +210,15 @@ def register_handlers(slack_app, settings: Settings) -> None:
         if channel_id and response_ts:
             try:
                 client.chat_update(channel=channel_id, ts=response_ts, text=primary_response)
-                _append_message_to_db(
-                    workspace_id=workspace_id,
-                    slack_user_id=user_id,
-                    channel_id=channel_id,
-                    role="assistant",
-                    text=primary_response,
-                    slack_ts=response_ts,
-                )
+                persist_assistant_message(primary_response, response_ts)
                 if followup_response:
                     send_followup_response(followup_response)
                 return
             except Exception as exc:
                 logger.info("Could not update final streaming message: %s", exc)
         sent = say(text=primary_response)
-        _append_message_to_db(
-            workspace_id=workspace_id,
-            slack_user_id=user_id,
-            channel_id=channel_id,
-            role="assistant",
-            text=primary_response,
-            slack_ts=str(getattr(sent, "get", lambda *_: "")("ts") or ""),
-        )
+        sent_ts = str(getattr(sent, "get", lambda *_: "")("ts") or "")
+        persist_assistant_message(primary_response, sent_ts)
         if followup_response:
             send_followup_response(followup_response)
 

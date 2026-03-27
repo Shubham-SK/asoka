@@ -6,6 +6,8 @@ from typing import Any, Callable
 
 from app.config import Settings
 from app.llm.client import get_claude_client
+from app.llm.json_utils import extract_json_object
+from app.llm.json_utils import extract_text_response
 from app.mcp.salesforce_client import SalesforceMcpClient, SalesforceMcpTool
 
 logger = logging.getLogger(__name__)
@@ -224,61 +226,8 @@ def _next_action(client: Any, model: str, transcript: list[dict[str, str]]) -> d
         system=MCP_SYSTEM_PROMPT,
         messages=transcript,
     )
-    text_parts: list[str] = []
-    for part in response.content:
-        if getattr(part, "type", "") == "text":
-            text_parts.append(part.text)
-    raw = "\n".join(text_parts).strip()
-    return _extract_json_object(raw)
-
-
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    raw_text = raw_text.strip()
-    if raw_text.startswith("```"):
-        raw_text = raw_text.strip("`")
-        raw_text = raw_text.replace("json", "", 1).strip()
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        candidate = _extract_first_json_object_text(raw_text)
-        if candidate is not None:
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
-        raise RuntimeError(f"Invalid JSON from LLM: {raw_text}") from exc
-
-
-def _extract_first_json_object_text(raw_text: str) -> str | None:
-    start = raw_text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for idx in range(start, len(raw_text)):
-        ch = raw_text[idx]
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            depth += 1
-            continue
-        if ch == "}":
-            depth -= 1
-            if depth == 0:
-                return raw_text[start : idx + 1]
-    return None
+    raw = extract_text_response(response)
+    return extract_json_object(raw)
 
 
 def _is_non_mutating_tool_name(tool_name: str) -> bool:

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass
-from typing import Any
 
 from app.config import Settings
 from app.llm.client import get_claude_client
+from app.llm.json_utils import extract_json_from_response
 
 CLASSIFIER_PROMPT = """
 You classify Slack DM requests for a Salesforce assistant.
@@ -26,6 +24,8 @@ Definitions:
 Rules:
 - Use best judgment from semantics, not keyword matching.
 - approval_response, knowledge_ingestion, and knowledge_management are only valid when is_coworker=true; otherwise choose read_request or write_request.
+- knowledge_ingestion must be explicit. Only choose it when user clearly asks to ingest/extract/persist/rebuild knowledge.
+- If user is answering a prior assistant question, giving context, or discussing plans/next steps without explicitly requesting ingestion, do NOT choose knowledge_ingestion.
 - Keep reason concise.
 """
 
@@ -42,10 +42,6 @@ def classify_message(
     settings: Settings,
     conversation_window: str = "",
 ) -> ClassificationResult:
-    rule_based = _rule_based_knowledge_intent(text=text, is_coworker=is_coworker)
-    if rule_based is not None:
-        return rule_based
-
     if not settings.llm_enabled or settings.llm_provider != "anthropic":
         return ClassificationResult(
             intent="read_request",
@@ -72,8 +68,7 @@ def classify_message(
             ],
         )
 
-        raw_text = _extract_text(response)
-        payload = _extract_json_object(raw_text)
+        payload = extract_json_from_response(response)
         intent = str(payload.get("intent", "read_request")).strip()
         reason = str(payload.get("reason", "model classification")).strip()
     except Exception as exc:
@@ -107,54 +102,3 @@ def classify_message(
         intent = "read_request"
         reason = "knowledge_management rejected for non-coworker"
     return ClassificationResult(intent=intent, reason=reason)
-
-
-def _extract_text(response: Any) -> str:
-    text_parts: list[str] = []
-    for part in response.content:
-        if getattr(part, "type", "") == "text":
-            text_parts.append(part.text)
-    return "\n".join(text_parts).strip()
-
-
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    raw_text = raw_text.strip()
-    if raw_text.startswith("```"):
-        raw_text = raw_text.strip("`")
-        raw_text = raw_text.replace("json", "", 1).strip()
-    return json.loads(raw_text)
-
-
-def _rule_based_knowledge_intent(text: str, is_coworker: bool) -> ClassificationResult | None:
-    if not is_coworker:
-        return None
-    normalized = " ".join(text.lower().split())
-    if not normalized:
-        return None
-
-    # Explicit ingestion requests only.
-    ingestion_patterns = [
-        r"\b(re[- ]?ingest|ingest|run ingestion|start ingestion)\b",
-        r"\b(extract|harvest|populate|persist)\b.{0,40}\bknowledge\b",
-        r"\brebuild\b.{0,40}\bknowledge\b",
-    ]
-    if any(re.search(pattern, normalized) for pattern in ingestion_patterns):
-        return ClassificationResult(
-            intent="knowledge_ingestion",
-            reason="rule_based: explicit ingestion request",
-        )
-
-    # Knowledge-instance query/CRUD requests.
-    management_patterns = [
-        r"\bwhat (?:have you|did you) learn",
-        r"\bwhat do you know\b",
-        r"\btesting philosophy\b",
-        r"\bknowledge (?:items|instances|base)\b",
-        r"\b(list|show|query|search|find|create|add|update|edit|delete|remove)\b.{0,30}\bknowledge\b",
-    ]
-    if any(re.search(pattern, normalized) for pattern in management_patterns):
-        return ClassificationResult(
-            intent="knowledge_management",
-            reason="rule_based: knowledge query or CRUD request",
-        )
-    return None

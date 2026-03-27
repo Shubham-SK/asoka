@@ -20,6 +20,8 @@ from app.db.repository import (
 )
 from app.db.session import SessionLocal
 from app.llm.client import get_claude_client
+from app.llm.json_utils import extract_json_object
+from app.llm.json_utils import extract_text_response
 
 logger = logging.getLogger(__name__)
 
@@ -307,63 +309,13 @@ def _next_action(client: Any, model: str, transcript: list[dict[str, str]]) -> d
         system=KNOWLEDGE_AGENT_PROMPT,
         messages=transcript,
     )
-    text_parts: list[str] = []
-    for part in response.content:
-        if getattr(part, "type", "") == "text":
-            text_parts.append(part.text)
-    raw = "\n".join(text_parts).strip()
+    raw = extract_text_response(response)
     try:
-        return _extract_json_object(raw)
+        return extract_json_object(raw)
     except Exception:
         if raw:
             return {"action": "final", "answer": raw}
         return {"action": "final", "answer": "I could not parse the knowledge action."}
-
-
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    raw_text = raw_text.strip()
-    if raw_text.startswith("```"):
-        raw_text = raw_text.strip("`")
-        raw_text = raw_text.replace("json", "", 1).strip()
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        candidate = _extract_first_json_object_text(raw_text)
-        if candidate is not None:
-            return json.loads(candidate)
-        raise
-
-
-def _extract_first_json_object_text(raw_text: str) -> str | None:
-    start = raw_text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for idx in range(start, len(raw_text)):
-        ch = raw_text[idx]
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            depth += 1
-            continue
-        if ch == "}":
-            depth -= 1
-            if depth == 0:
-                return raw_text[start : idx + 1]
-    return None
 
 
 def _build_observability_blob(

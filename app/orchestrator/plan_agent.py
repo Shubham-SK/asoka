@@ -19,8 +19,12 @@ from app.db.repository import (
 )
 from app.db.session import SessionLocal
 from app.llm.client import get_claude_client
+from app.llm.json_utils import extract_json_object
+from app.llm.json_utils import extract_text_response
+from app.llm.json_utils import repair_json_object_with_llm
 from app.orchestrator.plan_backend import execute_approved_plan
 from app.salesforce.client import get_salesforce_client
+from app.salesforce.soql import escape_soql_literal
 
 logger = logging.getLogger(__name__)
 
@@ -844,7 +848,7 @@ def _resolve_record(
             select_fields.append(candidate)
     soql = (
         f"SELECT {', '.join(select_fields)} FROM {object_name} "
-        f"WHERE {effective_field} = '{_soql_escape(field_value)}' LIMIT 2"
+        f"WHERE {effective_field} = '{escape_soql_literal(field_value)}' LIMIT 2"
     )
     result = sf.query(soql)
     records = result.get("records", []) if isinstance(result, dict) else []
@@ -1035,13 +1039,9 @@ def _next_action(client: Any, model: str, transcript: list[dict[str, str]]) -> d
         system=PLAN_AGENT_PROMPT,
         messages=transcript,
     )
-    text_parts: list[str] = []
-    for part in response.content:
-        if getattr(part, "type", "") == "text":
-            text_parts.append(part.text)
-    raw = "\n".join(text_parts).strip()
+    raw = extract_text_response(response)
     try:
-        return _extract_json_object(raw)
+        return extract_json_object(raw)
     except RuntimeError as exc:
         logger.warning(
             "Plan agent action JSON parse failed; attempting repair. raw_len=%s raw_preview=%s error=%s",
@@ -1080,27 +1080,18 @@ def _repair_action_json(client: Any, model: str, raw_text: str) -> dict[str, Any
     if not text:
         return None
     try:
-        response = client.messages.create(
+        parsed = repair_json_object_with_llm(
+            client=client,
             model=model,
-            max_tokens=700,
-            temperature=0,
-            system=(
-                "Convert the input into ONE strict JSON object only.\n"
-                "Allowed schemas:\n"
-                '{"action":"tool","tool":"...","input":{...},"reason":"..."}\n'
-                '{"action":"final","answer":"..."}\n'
-                "If uncertain, return final answer schema."
+            raw_text=text,
+            schema_hint=(
+                'one object matching {"action":"tool","tool":"...","input":{...},"reason":"..."} '
+                'or {"action":"final","answer":"..."}'
             ),
-            messages=[{"role": "user", "content": text}],
+            max_tokens=700,
         )
-        repaired_parts: list[str] = []
-        for part in response.content:
-            if getattr(part, "type", "") == "text":
-                repaired_parts.append(part.text)
-        repaired_raw = "\n".join(repaired_parts).strip()
-        if not repaired_raw:
+        if parsed is None:
             return None
-        parsed = _extract_json_object(repaired_raw)
         action_type = str(parsed.get("action", "")).strip()
         if action_type == "tool":
             tool = str(parsed.get("tool", "")).strip()
@@ -1120,57 +1111,6 @@ def _repair_action_json(client: Any, model: str, raw_text: str) -> dict[str, Any
             exc,
         )
         return None
-
-
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    raw_text = raw_text.strip()
-    if raw_text.startswith("```"):
-        raw_text = raw_text.strip("`")
-        raw_text = raw_text.replace("json", "", 1).strip()
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        candidate = _extract_first_json_object_text(raw_text)
-        if candidate is not None:
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
-        raise RuntimeError(f"Invalid JSON from LLM: {raw_text}") from exc
-
-
-def _extract_first_json_object_text(raw_text: str) -> str | None:
-    start = raw_text.find("{")
-    if start < 0:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for idx in range(start, len(raw_text)):
-        ch = raw_text[idx]
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            depth += 1
-            continue
-        if ch == "}":
-            depth -= 1
-            if depth == 0:
-                return raw_text[start : idx + 1]
-    return None
 
 
 def _build_observability_blob(
@@ -1263,10 +1203,6 @@ def _is_salesforce_id(value: str) -> bool:
 
 def _is_safe_symbol(value: str) -> bool:
     return bool(SF_SYMBOL_RE.fullmatch(value.strip()))
-
-
-def _soql_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def _knowledge_precheck_create_plan(

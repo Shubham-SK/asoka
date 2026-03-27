@@ -66,19 +66,27 @@ class Orchestrator:
             "role_scope_query",
             "plan_management",
         }:
-            return run_plan_agent(
-                settings=self.settings,
-                user_text=text,
-                workspace_id=workspace_id or "default",
-                requester_slack_user_id=user_id,
-                is_coworker=is_coworker,
-                parsed_intent=classification.intent,
-                parsed_intent_reason=classification.reason,
-                conversation_window=conversation_window,
-                notify_pending_plan_callback=plan_notification_callback,
-                notify_plan_status_callback=plan_status_notification_callback,
-                progress_callback=progress_callback,
-            )
+            try:
+                return run_plan_agent(
+                    settings=self.settings,
+                    user_text=text,
+                    workspace_id=workspace_id or "default",
+                    requester_slack_user_id=user_id,
+                    is_coworker=is_coworker,
+                    parsed_intent=classification.intent,
+                    parsed_intent_reason=classification.reason,
+                    conversation_window=conversation_window,
+                    notify_pending_plan_callback=plan_notification_callback,
+                    notify_plan_status_callback=plan_status_notification_callback,
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc:
+                logger.exception("Plan agent failed: %s", exc)
+                return (
+                    "I hit an internal planning error while handling that write/approval request. "
+                    "Please retry once. If it keeps failing, share the exact request and I will narrow "
+                    "the lookup/plan path."
+                )
 
         return self._handle_read_request(
             user_id=user_id,

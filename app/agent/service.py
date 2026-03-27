@@ -16,6 +16,8 @@ from app.agent.tools import (
 )
 from app.config import Settings
 from app.llm.client import get_claude_client
+from app.llm.json_utils import extract_json_object
+from app.llm.json_utils import extract_text_response
 
 logger = logging.getLogger(__name__)
 
@@ -243,133 +245,18 @@ def run_read_agent(
             _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
-        if action_type == "query":
-            soql = str(action.get("soql", "")).strip()
-            attempts.append(f"step {step + 1}: query `{_truncate_text(soql, 140) or '<missing>'}`")
-            events.append(
-                {
-                    "step": str(step + 1),
-                    "type": "query",
-                    "reason": action_reason or "no reason provided",
-                    "input": _truncate_text(soql, 220) or "<missing>",
-                    "status": "started",
-                    "output": "",
-                }
+        if action_type in {"query", "tooling_query"}:
+            _run_query_action(
+                action_type=action_type,
+                action=action,
+                step=step + 1,
+                action_reason=action_reason or "no reason provided",
+                attempts=attempts,
+                events=events,
+                transcript=transcript,
+                slack_user_id=slack_user_id,
+                workspace_id=workspace_id,
             )
-            transcript.append(
-                {
-                    "role": "assistant",
-                    "content": json.dumps(action),
-                }
-            )
-            if not soql:
-                transcript.append(
-                    {
-                        "role": "user",
-                        "content": "Tool error (query): missing SOQL. Provide a valid SELECT query.",
-                    }
-                )
-                attempts.append("  -> error: missing SOQL")
-                events[-1]["status"] = "error"
-                events[-1]["output"] = "missing SOQL"
-                _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
-                continue
-            try:
-                result = sf_query_read_only(
-                    soql,
-                    slack_user_id=slack_user_id or None,
-                    workspace_id=workspace_id or None,
-                )
-                summary = _summarize_query_result(result)
-                materialized = _materialize_result_for_model(
-                    result=result,
-                    source="query",
-                    include_rows_preview=True,
-                )
-                attempts.append(f"  -> success: {summary}")
-                events[-1]["status"] = "success"
-                events[-1]["output"] = _materialized_output_summary(summary, materialized)
-                events[-1]["rows_preview"] = materialized.get("rows_preview", [])
-                tool_content = f"Tool result (query):\n{materialized['model_payload']}"
-                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
-                transcript.append({"role": "user", "content": tool_content})
-            except Exception as exc:
-                logger.info("Query tool failed, allowing model retry: %s", exc)
-                attempts.append(f"  -> error: {type(exc).__name__}")
-                events[-1]["status"] = "error"
-                events[-1]["output"] = _truncate_text(f"{type(exc).__name__}: {exc}", 220)
-                transcript.append(
-                    {
-                        "role": "user",
-                        "content": f"Tool error (query): {type(exc).__name__}: {exc}",
-                    }
-                )
-            _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
-            continue
-
-        if action_type == "tooling_query":
-            soql = str(action.get("soql", "")).strip()
-            attempts.append(
-                f"step {step + 1}: tooling_query `{_truncate_text(soql, 140) or '<missing>'}`"
-            )
-            events.append(
-                {
-                    "step": str(step + 1),
-                    "type": "tooling_query",
-                    "reason": action_reason or "no reason provided",
-                    "input": _truncate_text(soql, 220) or "<missing>",
-                    "status": "started",
-                    "output": "",
-                }
-            )
-            transcript.append(
-                {
-                    "role": "assistant",
-                    "content": json.dumps(action),
-                }
-            )
-            if not soql:
-                transcript.append(
-                    {
-                        "role": "user",
-                        "content": "Tool error (tooling_query): missing SOQL. Provide a valid SELECT query.",
-                    }
-                )
-                attempts.append("  -> error: missing SOQL")
-                events[-1]["status"] = "error"
-                events[-1]["output"] = "missing SOQL"
-                _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
-                continue
-            try:
-                result = sf_tooling_query(
-                    soql,
-                    slack_user_id=slack_user_id or None,
-                    workspace_id=workspace_id or None,
-                )
-                summary = _summarize_query_result(result)
-                materialized = _materialize_result_for_model(
-                    result=result,
-                    source="tooling_query",
-                    include_rows_preview=True,
-                )
-                attempts.append(f"  -> success: {summary}")
-                events[-1]["status"] = "success"
-                events[-1]["output"] = _materialized_output_summary(summary, materialized)
-                events[-1]["rows_preview"] = materialized.get("rows_preview", [])
-                tool_content = f"Tool result (tooling_query):\n{materialized['model_payload']}"
-                events[-1]["model_preview"] = _truncate_text(tool_content, 320)
-                transcript.append({"role": "user", "content": tool_content})
-            except Exception as exc:
-                logger.info("Tooling query failed, allowing model retry: %s", exc)
-                attempts.append(f"  -> error: {type(exc).__name__}")
-                events[-1]["status"] = "error"
-                events[-1]["output"] = _truncate_text(f"{type(exc).__name__}: {exc}", 220)
-                transcript.append(
-                    {
-                        "role": "user",
-                        "content": f"Tool error (tooling_query): {type(exc).__name__}: {exc}",
-                    }
-                )
             _emit_progress_update(events, progress_callback, parsed_intent, parsed_intent_reason)
             continue
 
@@ -560,12 +447,8 @@ def _next_action(client: Any, model: str, transcript: list[dict[str, str]]) -> d
         system=SYSTEM_PROMPT,
         messages=transcript,
     )
-    text_parts: list[str] = []
-    for part in response.content:
-        if getattr(part, "type", "") == "text":
-            text_parts.append(part.text)
-    raw = "\n".join(text_parts).strip()
-    return _extract_json_object(raw)
+    raw = extract_text_response(response)
+    return extract_json_object(raw)
 
 
 def _force_finalize(
@@ -601,66 +484,80 @@ def _force_finalize(
             system=FORCED_FINAL_PROMPT,
             messages=final_messages,
         )
-        text_parts: list[str] = []
-        for part in response.content:
-            if getattr(part, "type", "") == "text":
-                text_parts.append(part.text)
-        text = "\n".join(text_parts).strip()
+        text = extract_text_response(response)
         return text
     except Exception as exc:
         logger.info("Forced finalization failed: %s", exc)
         return ""
 
 
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    raw_text = raw_text.strip()
-    if raw_text.startswith("```"):
-        raw_text = raw_text.strip("`")
-        raw_text = raw_text.replace("json", "", 1).strip()
+def _run_query_action(
+    action_type: str,
+    action: dict[str, Any],
+    step: int,
+    action_reason: str,
+    attempts: list[str],
+    events: list[dict[str, Any]],
+    transcript: list[dict[str, str]],
+    slack_user_id: str,
+    workspace_id: str,
+) -> None:
+    soql = str(action.get("soql", "")).strip()
+    attempts.append(f"step {step}: {action_type} `{_truncate_text(soql, 140) or '<missing>'}`")
+    events.append(
+        {
+            "step": str(step),
+            "type": action_type,
+            "reason": action_reason,
+            "input": _truncate_text(soql, 220) or "<missing>",
+            "status": "started",
+            "output": "",
+        }
+    )
+    transcript.append({"role": "assistant", "content": json.dumps(action)})
+    if not soql:
+        transcript.append(
+            {
+                "role": "user",
+                "content": f"Tool error ({action_type}): missing SOQL. Provide a valid SELECT query.",
+            }
+        )
+        attempts.append("  -> error: missing SOQL")
+        events[-1]["status"] = "error"
+        events[-1]["output"] = "missing SOQL"
+        return
+
+    query_fn = sf_query_read_only if action_type == "query" else sf_tooling_query
     try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        candidate = _extract_first_json_object_text(raw_text)
-        if candidate is not None:
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
-        raise RuntimeError(f"Invalid JSON from LLM: {raw_text}") from exc
-
-
-def _extract_first_json_object_text(raw_text: str) -> str | None:
-    start = raw_text.find("{")
-    if start < 0:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for idx in range(start, len(raw_text)):
-        ch = raw_text[idx]
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            depth += 1
-            continue
-        if ch == "}":
-            depth -= 1
-            if depth == 0:
-                return raw_text[start : idx + 1]
-    return None
+        result = query_fn(
+            soql,
+            slack_user_id=slack_user_id or None,
+            workspace_id=workspace_id or None,
+        )
+        summary = _summarize_query_result(result)
+        materialized = _materialize_result_for_model(
+            result=result,
+            source=action_type,
+            include_rows_preview=True,
+        )
+        attempts.append(f"  -> success: {summary}")
+        events[-1]["status"] = "success"
+        events[-1]["output"] = _materialized_output_summary(summary, materialized)
+        events[-1]["rows_preview"] = materialized.get("rows_preview", [])
+        tool_content = f"Tool result ({action_type}):\n{materialized['model_payload']}"
+        events[-1]["model_preview"] = _truncate_text(tool_content, 320)
+        transcript.append({"role": "user", "content": tool_content})
+    except Exception as exc:
+        logger.info("%s tool failed, allowing model retry: %s", action_type, exc)
+        attempts.append(f"  -> error: {type(exc).__name__}")
+        events[-1]["status"] = "error"
+        events[-1]["output"] = _truncate_text(f"{type(exc).__name__}: {exc}", 220)
+        transcript.append(
+            {
+                "role": "user",
+                "content": f"Tool error ({action_type}): {type(exc).__name__}: {exc}",
+            }
+        )
 
 
 def _truncate_json(value: Any, max_chars: int = 8000) -> str:

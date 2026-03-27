@@ -12,7 +12,10 @@ from app.db.enums import PlanStatus
 from app.db.repository import get_execution_plan_for_workspace, set_execution_plan_status
 from app.db.session import SessionLocal
 from app.llm.client import get_claude_client
+from app.llm.json_utils import extract_json_object
+from app.llm.json_utils import extract_text_response
 from app.salesforce.client import get_salesforce_client
+from app.salesforce.soql import escape_soql_literal
 
 logger = logging.getLogger(__name__)
 SF_ID_RE = re.compile(r"^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$")
@@ -414,7 +417,10 @@ def _resolve_lookup_record_id(sf: Any, op: dict[str, Any]) -> dict[str, Any]:
         available_fields=available_fields,
     )
 
-    soql = f"SELECT Id FROM {object_name} WHERE {field_name} = '{_soql_escape(field_value)}' LIMIT 201"
+    soql = (
+        f"SELECT Id FROM {object_name} "
+        f"WHERE {field_name} = '{escape_soql_literal(field_value)}' LIMIT 201"
+    )
     result = sf.query(soql)
     records = result.get("records", []) if isinstance(result, dict) else []
     if not isinstance(records, list):
@@ -485,11 +491,7 @@ def _repair_operation_with_model(
             ),
             messages=[{"role": "user", "content": prompt}],
         )
-        text_parts: list[str] = []
-        for part in response.content:
-            if getattr(part, "type", "") == "text":
-                text_parts.append(part.text)
-        repaired = _extract_json_object("\n".join(text_parts).strip())
+        repaired = extract_json_object(extract_text_response(response))
         if not isinstance(repaired, dict):
             return None, ""
         if str(repaired.get("op", "")).strip().lower() != str(op.get("op", "")).strip().lower():
@@ -632,56 +634,6 @@ def _register_operation_reference(
         record_id = str(op.get("record_id", "")).strip()
         if _is_salesforce_id(record_id):
             ref_values[alias] = record_id
-
-
-def _extract_json_object(raw_text: str) -> dict[str, Any]:
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        text = text.replace("json", "", 1).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        candidate = _extract_first_json_object_text(text)
-        if candidate is None:
-            raise RuntimeError("Invalid JSON from model repair output.") from exc
-        return json.loads(candidate)
-
-
-def _extract_first_json_object_text(raw_text: str) -> str | None:
-    start = raw_text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for idx in range(start, len(raw_text)):
-        ch = raw_text[idx]
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            depth += 1
-            continue
-        if ch == "}":
-            depth -= 1
-            if depth == 0:
-                return raw_text[start : idx + 1]
-    return None
-
-
-def _soql_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def _describe_field_names(sf: Any, object_name: str) -> set[str]:

@@ -10,6 +10,7 @@ from app.agent.artifacts import (
     artifact_tree,
 )
 from app.salesforce.client import get_salesforce_client
+from app.salesforce.soql import execute_read_query, execute_tooling_query
 
 
 def sf_describe_object(
@@ -26,12 +27,11 @@ def sf_query_read_only(
     slack_user_id: str | None = None,
     workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    normalized = soql.strip().lower()
-    if not normalized.startswith("select"):
-        raise ValueError("Only read-only SELECT SOQL is allowed in Phase 1.")
-
-    sf = get_salesforce_client(slack_user_id=slack_user_id, workspace_id=workspace_id)
-    return sf.query(soql)
+    return execute_read_query(
+        soql,
+        slack_user_id=slack_user_id,
+        workspace_id=workspace_id,
+    )
 
 
 def sf_tooling_query(
@@ -43,12 +43,11 @@ def sf_tooling_query(
     Read-only Tooling API query surface (metadata-focused).
     Example: SELECT Id, ValidationName, EntityDefinitionId FROM ValidationRule LIMIT 20
     """
-    normalized = soql.strip().lower()
-    if not normalized.startswith("select"):
-        raise ValueError("Only read-only SELECT SOQL is allowed for tooling queries.")
-
-    sf = get_salesforce_client(slack_user_id=slack_user_id, workspace_id=workspace_id)
-    return sf.restful("tooling/query", params={"q": soql})
+    return execute_tooling_query(
+        soql,
+        slack_user_id=slack_user_id,
+        workspace_id=workspace_id,
+    )
 
 
 def artifact_store(payload: Any, source: str) -> dict[str, Any]:
